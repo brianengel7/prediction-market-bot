@@ -5,6 +5,9 @@ from src.weather.distribution import (
     calculate_smoothed_market_probability
 )
 
+PROBABILITY_MODEL_VERSION = (
+    "raw-gefs-atmos25-kde-v1"
+)
 
 def calculate_market_probability(
     market,
@@ -215,7 +218,9 @@ def calculate_market_edge(
         "no_edge": no_edge,
 
         "best_side": best_side,
-        "best_edge": best_edge
+        "best_edge": best_edge,
+
+        "model_version": PROBABILITY_MODEL_VERSION
     }
 
 

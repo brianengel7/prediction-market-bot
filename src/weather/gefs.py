@@ -2,16 +2,19 @@ from herbie import Herbie
 import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
-
 from src.database.db import (
     get_cached_temperature,
     save_temperature
+)
+from src.weather.settlement import (
+    get_kxhighny_settlement_window
 )
 
 
 CENTRAL_PARK_LAT = 40.77898
 CENTRAL_PARK_LON = -73.96925
 NYC_TIMEZONE = ZoneInfo("America/New_York")
+GEFS_PRODUCT = "atmos.25"
 
 
 def make_utc_timestamp(timestamp):
@@ -51,7 +54,7 @@ def get_latest_gefs_run():
         gefs = Herbie(
             herbie_time,
             model="gefs",
-            product="atmos.5",
+            product=GEFS_PRODUCT,
             member=0,
             fxx=0,
             verbose=False
@@ -74,22 +77,18 @@ def get_gefs_forecast_hours(
     target_date,
     not_before=None
 ):
-    """
-    Return GEFS forecast hours for the target date.
-
-    If not_before is supplied, ignore forecast times
-    that have already occurred.
-    """
-
     run_time = make_utc_timestamp(
         run_time
     )
 
-    target_date = pd.Timestamp(
-        target_date
-    ).date()
+    start_local, end_local = (
+        get_kxhighny_settlement_window(
+            target_date
+        )
+    )
 
     if not_before is not None:
+
         not_before = pd.Timestamp(
             not_before
         )
@@ -107,6 +106,11 @@ def get_gefs_forecast_hours(
                 )
             )
 
+        start_local = max(
+            start_local,
+            not_before
+        )
+
     forecast_hours = []
 
     for forecast_hour in range(
@@ -114,7 +118,6 @@ def get_gefs_forecast_hours(
         121,
         3
     ):
-
         valid_time_utc = (
             run_time
             + pd.Timedelta(
@@ -128,41 +131,21 @@ def get_gefs_forecast_hours(
             )
         )
 
-        if (
-            valid_time_local.date()
-            == target_date
-        ):
+        if valid_time_local < start_local:
+            continue
 
-            # For today's market, skip
-            # forecast times already in the past.
-            if (
-                not_before is not None
-                and valid_time_local
-                < not_before
-            ):
-                continue
-
-            # We only care about daytime/evening
-            # for the daily maximum.
-            if (
-                8
-                <= valid_time_local.hour
-                <= 23
-            ):
-                forecast_hours.append(
-                    forecast_hour
-                )
-
-        if (
-            valid_time_local.date()
-            > target_date
-        ):
+        if valid_time_local >= end_local:
             break
+
+        forecast_hours.append(
+            forecast_hour
+        )
 
     if not forecast_hours:
         raise ValueError(
-            "GEFS has no usable forecast hours "
-            f"for target date {target_date}."
+            "GEFS has no forecast points "
+            f"inside the settlement window "
+            f"for {target_date}."
         )
 
     return forecast_hours
@@ -183,6 +166,7 @@ def get_gefs_temperature(
 
     cached = get_cached_temperature(
         model="gefs",
+        product=GEFS_PRODUCT,
         member=member_name,
         run_time=run_time_utc,
         forecast_hour=forecast_hour,
@@ -213,7 +197,7 @@ def get_gefs_temperature(
     gefs = Herbie(
         herbie_run_time,
         model="gefs",
-        product="atmos.5",
+        product=GEFS_PRODUCT,
         member=member,
         fxx=forecast_hour,
         verbose=False
@@ -221,6 +205,31 @@ def get_gefs_temperature(
 
     data = gefs.xarray(
         "TMP:2 m"
+    )
+    nearest_point = data.sel(
+        latitude=CENTRAL_PARK_LAT,
+        longitude=CENTRAL_PARK_LON % 360,
+        method="nearest"
+    )
+
+    actual_lat = float(
+        nearest_point.latitude.values
+    )
+
+    actual_lon = float(
+        nearest_point.longitude.values
+    )
+
+    actual_lon_west = (
+        actual_lon
+        if actual_lon <= 180
+        else actual_lon - 360
+    )
+
+    print(
+        f"GEFS grid point: "
+        f"{actual_lat:.3f}, "
+        f"{actual_lon_west:.3f}"
     )
 
     try:
@@ -230,11 +239,7 @@ def get_gefs_temperature(
         )
 
         temperature_kelvin = float(
-            data["t2m"].sel(
-                latitude=CENTRAL_PARK_LAT,
-                longitude=target_lon,
-                method="nearest"
-            ).values
+            nearest_point["t2m"].values
         )
 
         temperature_fahrenheit = (
@@ -271,6 +276,7 @@ def get_gefs_temperature(
 
     save_temperature(
         model="gefs",
+        product=GEFS_PRODUCT,
         member=member_name,
         run_time=run_time_utc,
         forecast_hour=forecast_hour,
@@ -380,11 +386,9 @@ def get_gefs_ensemble(
         )
 
         print()
-        print("=" * 50)
         print(
             f"GEFS MEMBER: {member_name}"
         )
-        print("=" * 50)
 
         result = get_gefs_member_high(
             run_time,

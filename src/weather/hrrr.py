@@ -6,6 +6,9 @@ from src.database.db import (
     get_cached_temperature,
     save_temperature
 )
+from src.weather.settlement import (
+    get_kxhighny_settlement_window
+)
 
 CENTRAL_PARK_LAT = 40.77898
 CENTRAL_PARK_LON = -73.96925
@@ -57,20 +60,62 @@ def get_forecast_hour(run_time, target_date, local_hour):
     return forecast_hour
 
 
-def get_forecast_hours(run_time, target_date):
+def get_forecast_hours(
+    run_time,
+    target_date
+):
+    run_time = make_utc_timestamp(
+        run_time
+    )
 
-    local_hours = range(8, 23, 2)
+    start_local, end_local = (
+        get_kxhighny_settlement_window(
+            target_date
+        )
+    )
+
+    start_utc = start_local.tz_convert(
+        "UTC"
+    )
+
+    end_utc = end_local.tz_convert(
+        "UTC"
+    )
+
+    valid_times = pd.date_range(
+        start=start_utc,
+        end=end_utc,
+        freq="1h",
+        inclusive="left"
+    )
 
     forecast_hours = []
 
-    for local_hour in local_hours:
-        forecast_hour = get_forecast_hour(
-            run_time,
-            target_date,
-            local_hour
+    for valid_time in valid_times:
+
+        hours_from_run = (
+            valid_time - run_time
+        ).total_seconds() / 3600
+
+        forecast_hour = int(
+            round(hours_from_run)
         )
 
-        forecast_hours.append(forecast_hour)
+        if forecast_hour < 0:
+            raise ValueError(
+                "Target climate day begins "
+                "before this HRRR run."
+            )
+
+        if forecast_hour > 48:
+            raise ValueError(
+                f"HRRR run does not cover "
+                f"F{forecast_hour}."
+            )
+
+        forecast_hours.append(
+            forecast_hour
+        )
 
     return forecast_hours
 
@@ -82,6 +127,7 @@ def get_hrrr_temperature(run_time, forecast_hour):
 
     cached = get_cached_temperature(
         model="hrrr",
+        product="sfc",
         run_time=run_time_utc,
         forecast_hour=forecast_hour,
         latitude=CENTRAL_PARK_LAT,
@@ -167,6 +213,7 @@ def get_hrrr_temperature(run_time, forecast_hour):
 
     save_temperature(
         model="hrrr",
+        product="sfc",
         run_time=run_time_utc,
         forecast_hour=forecast_hour,
         latitude=CENTRAL_PARK_LAT,
@@ -182,17 +229,24 @@ def get_hrrr_temperature(run_time, forecast_hour):
     }
 
 
-def get_hrrr_run(run_time, target_date):
+def get_hrrr_run(
+    run_time,
+    target_date
+):
+    run_time_utc = make_utc_timestamp(
+        run_time
+    )
 
-    run_time_utc = make_utc_timestamp(run_time)
-    target_date = pd.Timestamp(target_date).date()
+    target_date = pd.Timestamp(
+        target_date
+    ).date()
 
     forecast_hours = get_forecast_hours(
         run_time,
         target_date
     )
 
-    readings = {}
+    temperatures = []
 
     for forecast_hour in forecast_hours:
 
@@ -201,76 +255,30 @@ def get_hrrr_run(run_time, target_date):
             forecast_hour
         )
 
-        readings[forecast_hour] = reading
+        temperatures.append(
+            reading
+        )
 
         print(
-            f"{reading['valid_time']:%I:%M %p}: "
+            f"{reading['valid_time']:%m/%d %I:%M %p}: "
             f"{reading['temperature']:.2f}°F"
         )
 
-    coarse_maximum = max(
-        readings.values(),
-        key=lambda reading: reading["temperature"]
-    )
-
-    hottest_forecast_hour = coarse_maximum[
-        "forecast_hour"
-    ]
-
-    refinement_hours = [
-        hottest_forecast_hour - 1,
-        hottest_forecast_hour + 1
-    ]
-
-    for forecast_hour in refinement_hours:
-
-        if forecast_hour < 0 or forecast_hour > 48:
-            continue
-
-        if forecast_hour in readings:
-            continue
-
-        valid_time_utc = (
-            run_time_utc
-            + pd.Timedelta(hours=forecast_hour)
-        )
-
-        valid_time_local = valid_time_utc.tz_convert(
-            NYC_TIMEZONE
-        )
-
-        if valid_time_local.date() != target_date:
-            continue
-
-        reading = get_hrrr_temperature(
-            run_time,
-            forecast_hour
-        )
-
-        readings[forecast_hour] = reading
-
-        print(
-            f"{reading['valid_time']:%I:%M %p}: "
-            f"{reading['temperature']:.2f}°F "
-            "(refinement)"
-        )
-
-    temperatures = sorted(
-        readings.values(),
-        key=lambda reading: reading["valid_time"]
-    )
-
     maximum = max(
         temperatures,
-        key=lambda reading: reading["temperature"]
+        key=lambda reading:
+        reading["temperature"]
     )
 
     return {
         "run_time": run_time_utc,
         "target_date": target_date,
-        "max_temperature": maximum["temperature"],
-        "max_time": maximum["valid_time"],
-        "temperatures": temperatures
+        "max_temperature":
+            maximum["temperature"],
+        "max_time":
+            maximum["valid_time"],
+        "temperatures":
+            temperatures
     }
 
 

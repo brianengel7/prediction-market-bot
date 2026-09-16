@@ -1,6 +1,9 @@
 import requests
 import pandas as pd
 from zoneinfo import ZoneInfo
+from src.weather.settlement import (
+    get_kxhighny_settlement_window
+)
 
 
 NWS_BASE_URL = "https://api.weather.gov"
@@ -110,14 +113,11 @@ def get_observed_high(
     target_date,
     station_id=CENTRAL_PARK_STATION
 ):
-    """
-    Return the highest observed temperature
-    for target_date so far.
-    """
-
-    target_date = pd.Timestamp(
-        target_date
-    ).date()
+    start_time, end_time = (
+        get_kxhighny_settlement_window(
+            target_date
+        )
+    )
 
     observations = (
         get_station_observations(
@@ -125,12 +125,23 @@ def get_observed_high(
         )
     )
 
+    now = pd.Timestamp.now(
+        tz=NYC_TIMEZONE
+    )
+
+    effective_end = min(
+        end_time,
+        now
+    )
+
     daily_observations = [
         observation
         for observation in observations
-        if observation[
-            "time"
-        ].date() == target_date
+        if (
+            start_time
+            <= observation["time"]
+            < effective_end
+        )
     ]
 
     if not daily_observations:
@@ -146,24 +157,14 @@ def get_observed_high(
 
     return {
         "station": station_id,
-
-        "observed_high": maximum[
-            "temperature"
-        ],
-
-        "high_time": maximum[
-            "time"
-        ],
-
-        "latest_temperature": latest[
-            "temperature"
-        ],
-
-        "latest_time": latest[
-            "time"
-        ],
-
-        "observation_count": len(
-            daily_observations
-        )
+        "observed_high":
+            maximum["temperature"],
+        "high_time":
+            maximum["time"],
+        "latest_temperature":
+            latest["temperature"],
+        "latest_time":
+            latest["time"],
+        "observation_count":
+            len(daily_observations)
     }

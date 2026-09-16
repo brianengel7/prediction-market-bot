@@ -17,6 +17,7 @@ def initialize_database():
             """
             CREATE TABLE IF NOT EXISTS weather_forecasts (
                 model TEXT NOT NULL,
+                product TEXT NOT NULL,
                 member TEXT NOT NULL,
                 run_time TEXT NOT NULL,
                 forecast_hour INTEGER NOT NULL,
@@ -27,6 +28,7 @@ def initialize_database():
 
                 PRIMARY KEY (
                     model,
+                    product,
                     member,
                     run_time,
                     forecast_hour,
@@ -54,7 +56,11 @@ def initialize_database():
 
                 hrrr_latest_run TEXT,
                 hrrr_latest_high REAL,
-                hrrr_latest_change REAL
+                hrrr_latest_change REAL,
+
+                gefs_product TEXT,
+                nws_high REAL,
+                model_version TEXT NOT NULL
             )
             """
         )
@@ -88,7 +94,9 @@ def initialize_database():
                 no_edge REAL,
 
                 best_side TEXT,
-                best_edge REAL
+                best_edge REAL,
+
+                model_version TEXT NOT NULL
             )
             """
         )
@@ -96,6 +104,7 @@ def initialize_database():
 
 def get_cached_temperature(
     model,
+    product,
     run_time,
     forecast_hour,
     latitude,
@@ -116,6 +125,7 @@ def get_cached_temperature(
             SELECT valid_time, temperature_f
             FROM weather_forecasts
             WHERE model = ?
+              AND product = ?
               AND member = ?
               AND run_time = ?
               AND forecast_hour = ?
@@ -124,6 +134,7 @@ def get_cached_temperature(
             """,
             (
                 model,
+                product,
                 member,
                 run_time.isoformat(),
                 forecast_hour,
@@ -148,6 +159,7 @@ def get_cached_temperature(
 
 def save_temperature(
     model,
+    product,
     run_time,
     forecast_hour,
     latitude,
@@ -169,8 +181,38 @@ def save_temperature(
 
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS weather_forecasts (
+                model TEXT NOT NULL,
+                product TEXT NOT NULL,
+                member TEXT NOT NULL,
+
+                run_time TEXT NOT NULL,
+                forecast_hour INTEGER NOT NULL,
+
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+
+                valid_time TEXT NOT NULL,
+                temperature_f REAL NOT NULL,
+
+                PRIMARY KEY (
+                    model,
+                    product,
+                    member,
+                    run_time,
+                    forecast_hour,
+                    latitude,
+                    longitude
+                )
+            )
+            """
+        )
+
+        connection.execute(
+            """
             INSERT OR REPLACE INTO weather_forecasts (
                 model,
+                product,
                 member,
                 run_time,
                 forecast_hour,
@@ -179,10 +221,11 @@ def save_temperature(
                 valid_time,
                 temperature_f
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 model,
+                product,
                 member,
                 run_time.isoformat(),
                 forecast_hour,
@@ -196,13 +239,22 @@ def save_temperature(
 def save_model_snapshot(
     target_date,
     gefs_results,
-    hrrr_results
+    hrrr_results,
+    nws_result,
+    model_version
 ):
     snapshot_time = pd.Timestamp.now(
         tz="UTC"
     ).isoformat()
 
     latest_hrrr = hrrr_results[-1]
+
+    nws_high = None
+
+    if nws_result is not None:
+        nws_high = nws_result[
+            "temperature"
+        ]
 
     with get_connection() as connection:
 
@@ -221,10 +273,13 @@ def save_model_snapshot(
 
                 hrrr_latest_run,
                 hrrr_latest_high,
-                hrrr_latest_change
+                hrrr_latest_change,
+
+                nws_high,
+                model_version
             )
 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot_time,
@@ -266,7 +321,15 @@ def save_model_snapshot(
 
                 latest_hrrr[
                     "change"
-                ]
+                ],
+
+                (
+                nws_result["temperature"]
+                    if nws_result is not None
+                    else None
+                ),
+
+                model_version
             )
         )
 
@@ -308,14 +371,15 @@ def save_market_snapshots(
                     no_edge,
 
                     best_side,
-                    best_edge
+                    best_edge,
+                    model_version
                 )
 
                 VALUES (
                     ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?, ?, ?
+                    ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -388,7 +452,9 @@ def save_market_snapshots(
 
                     result[
                         "best_edge"
-                    ]
+                    ],
+
+                    result["model_version"]
                 )
             )
 

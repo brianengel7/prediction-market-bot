@@ -24,3 +24,8 @@ __pycache__/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
