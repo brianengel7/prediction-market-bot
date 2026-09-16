@@ -316,41 +316,105 @@ def compare_hrrr_runs(run_times, target_date):
 
     return results
 
-def get_recent_hrrr_runs(count=3):
+def get_recent_hrrr_runs(
+    target_date,
+    count=3
+):
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
 
-    now = pd.Timestamp.now(tz="UTC")
-
-    candidate = now.floor("6h")
+    candidate = now.floor(
+        "6h"
+    )
 
     runs = []
 
-    while len(runs) < count:
+    attempts = 0
+    max_attempts = 12
 
-        herbie_time = candidate.tz_localize(None)
+    while (
+        len(runs) < count
+        and attempts < max_attempts
+    ):
+
+        attempts += 1
 
         print(
             f"Checking HRRR "
             f"{candidate:%Y-%m-%d %HZ}..."
         )
 
+        try:
+
+            forecast_hours = (
+                get_forecast_hours(
+                    candidate,
+                    target_date
+                )
+            )
+
+        except ValueError as error:
+
+            print(
+                f"Skipping HRRR "
+                f"{candidate:%Y-%m-%d %HZ}: "
+                f"{error}"
+            )
+
+            candidate -= pd.Timedelta(
+                hours=6
+            )
+
+            continue
+
+        required_forecast_hour = max(
+            forecast_hours
+        )
+
+        herbie_time = (
+            candidate.tz_localize(None)
+        )
+
         hrrr = Herbie(
             herbie_time,
             model="hrrr",
             product="sfc",
-            fxx=24,
+            fxx=required_forecast_hour,
             verbose=False
         )
 
         if hrrr.grib is not None:
 
             print(
-                f"Found extended HRRR run: "
-                f"{candidate:%Y-%m-%d %HZ}"
+                f"Found usable HRRR run: "
+                f"{candidate:%Y-%m-%d %HZ} "
+                f"(through F"
+                f"{required_forecast_hour})"
             )
 
-            runs.append(candidate)
+            runs.append(
+                candidate
+            )
 
-        candidate -= pd.Timedelta(hours=6)
+        else:
+
+            print(
+                f"HRRR "
+                f"{candidate:%Y-%m-%d %HZ} "
+                f"does not yet have F"
+                f"{required_forecast_hour}."
+            )
+
+        candidate -= pd.Timedelta(
+            hours=6
+        )
+
+    if not runs:
+        raise RuntimeError(
+            "No HRRR runs currently cover "
+            f"target date {target_date}."
+        )
 
     runs.reverse()
 

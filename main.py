@@ -1,26 +1,113 @@
-from src.kalshi.nws import get_markets
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import pandas as pd
+from src.kalshi.nws import get_markets, get_event
 from src.kalshi.markets import parse_markets
+from src.kalshi.events import get_weather_target_date
+from src.weather.hrrr import compare_hrrr_runs, get_recent_hrrr_runs
+from src.weather.gefs import get_latest_gefs_run, get_gefs_ensemble
+from src.strategy.weather_edge import analyze_weather_markets
+from src.database.db import save_model_snapshot, save_market_snapshots
+from src.weather.observations import get_observed_high
 
-from src.weather.hrrr import (
-    compare_hrrr_runs,
-    get_recent_hrrr_runs
+NYC_TIMEZONE = ZoneInfo(
+    "America/New_York"
 )
 
-from src.weather.gefs import (
-    get_latest_gefs_run,
-    get_gefs_ensemble
+markets_data = get_markets(
+    series_ticker="KXHIGHNY",
+    status="open"
 )
 
-from src.strategy.weather_edge import (
-    analyze_weather_markets
+markets = parse_markets(
+    markets_data
+)
+
+if not markets:
+    raise RuntimeError(
+        "No open KXHIGHNY markets found."
+    )
+
+
+event_tickers = {
+    market["event_ticker"]
+    for market in markets
+}
+
+
+events = []
+
+for event_ticker in event_tickers:
+
+    event = get_event(
+        event_ticker
+    )
+
+    event_target_date = (
+        get_weather_target_date(
+            event
+        )
+    )
+
+    events.append({
+        "event_ticker": event_ticker,
+        "event": event,
+        "target_date": event_target_date
+    })
+
+
+today = datetime.now(
+    NYC_TIMEZONE
+).date()
+
+
+future_events = [
+    event_info
+    for event_info in events
+    if datetime.strptime(
+        event_info["target_date"],
+        "%Y-%m-%d"
+    ).date() > today
+]
+
+
+if not future_events:
+    raise RuntimeError(
+        "No future KXHIGHNY events found."
+    )
+
+
+future_events.sort(
+    key=lambda event_info:
+    event_info["target_date"]
 )
 
 
-target_date = "2026-09-16"
+selected_event = future_events[0]
 
+
+event_ticker = selected_event[
+    "event_ticker"
+]
+
+event = selected_event[
+    "event"
+]
+
+target_date = selected_event[
+    "target_date"
+]
+
+markets = [
+    market
+    for market in markets
+    if market["event_ticker"]
+    == event_ticker
+]
 # HRRR
 
 run_times = get_recent_hrrr_runs(
+    target_date=target_date,
     count=3
 )
 
@@ -35,18 +122,21 @@ hrrr_results = compare_hrrr_runs(
     target_date
 )
 
-# KALSHI
-
-markets_data = get_markets(
-    series_ticker="KXHIGHNY",
-    status="open"
-)
-
-markets = parse_markets(
-    markets_data
-)
-
 # GEFS
+
+target_date_obj = (
+    pd.Timestamp(
+        target_date
+    ).date()
+)
+
+now_nyc = pd.Timestamp.now(
+    tz=NYC_TIMEZONE
+)
+
+observed_high = None
+not_before = None
+
 
 gefs_run = get_latest_gefs_run()
 
@@ -55,7 +145,17 @@ members = range(0, 31)
 gefs_results = get_gefs_ensemble(
     run_time=gefs_run,
     target_date=target_date,
-    members=members
+    members=members,
+    not_before=not_before,
+    observed_high=observed_high
+)
+
+# Observations
+
+observation_results = (
+    get_observed_high(
+        today
+    )
 )
 
 # RAW EDGE CALCULATION
@@ -63,6 +163,18 @@ gefs_results = get_gefs_ensemble(
 edge_results = analyze_weather_markets(
     markets=markets,
     gefs_results=gefs_results
+)
+
+snapshot_time = save_model_snapshot(
+    target_date=target_date,
+    gefs_results=gefs_results,
+    hrrr_results=hrrr_results
+)
+
+save_market_snapshots(
+    snapshot_time=snapshot_time,
+    target_date=target_date,
+    edge_results=edge_results
 )
 
 # HRRR SUMMARY
@@ -132,15 +244,25 @@ for result in edge_results:
     print(result["title"])
 
     print(
-        f"GEFS YES:   "
-        f"{result['model_yes']:6.2%} "
+        f"Raw GEFS:      "
+        f"{result['raw_gefs_yes']:6.2%} "
         f"({result['yes_count']}/"
         f"{result['total_members']})"
     )
 
     print(
-        f"GEFS NO:    "
+        f"Smoothed YES:  "
+        f"{result['model_yes']:6.2%}"
+    )
+
+    print(
+        f"Smoothed NO:   "
         f"{result['model_no']:6.2%}"
+    )
+
+    print(
+        f"KDE bandwidth: "
+        f"{result['bandwidth']:.2f}°F"
     )
 
     print()
@@ -190,3 +312,65 @@ for result in edge_results:
     else:
 
         print("RAW EDGE:   PASS")
+
+print()
+print("CENTRAL PARK OBSERVATIONS")
+
+if observation_results is None:
+
+    print(
+        "No observations found."
+    )
+
+else:
+
+    print(
+        f"Latest: "
+        f"{observation_results['latest_temperature']:.2f}°F "
+        f"at "
+        f"{observation_results['latest_time']:%I:%M %p}"
+    )
+
+    print(
+        f"High so far: "
+        f"{observation_results['observed_high']:.2f}°F "
+        f"at "
+        f"{observation_results['high_time']:%I:%M %p}"
+    )
+
+    print(
+        f"Observations: "
+        f"{observation_results['observation_count']}"
+    )
+
+if target_date_obj == today:
+
+    observations = (
+        get_observed_high(
+            target_date
+        )
+    )
+
+    if observations is not None:
+
+        observed_high = observations[
+            "observed_high"
+        ]
+
+        not_before = now_nyc
+
+        print()
+        print("LIVE OBSERVATION CONDITIONING")
+
+        print(
+            f"Observed high so far: "
+            f"{observed_high:.2f}°F"
+        )
+
+        print(
+            f"Latest observation: "
+            f"{observations['latest_temperature']:.2f}°F "
+            f"at "
+            f"{observations['latest_time']:%I:%M %p}"
+        )
+

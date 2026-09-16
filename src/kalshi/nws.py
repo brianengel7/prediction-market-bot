@@ -39,3 +39,13 @@ def get_series(series_ticker):
     data = response.json()
 
     return data["series"]
+    
+def get_event(event_ticker):
+    url = f"{BASE_URL}/events/{event_ticker}"
+
+    response = requests.get(url)
+    response.raise_for_status()
+
+    data = response.json()
+
+    return data["event"]

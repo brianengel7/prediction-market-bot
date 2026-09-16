@@ -7,6 +7,7 @@ def parse_markets(markets_data):
 
     for market in markets:
         ticker = market["ticker"]
+        event_ticker = market["event_ticker"]
         title = market["title"]
 
         strike_type = market["strike_type"]
@@ -24,6 +25,7 @@ def parse_markets(markets_data):
 
         parsed_market = {
             "ticker": ticker,
+            "event_ticker": event_ticker,
             "title": title,
 
             "strike_type": strike_type,

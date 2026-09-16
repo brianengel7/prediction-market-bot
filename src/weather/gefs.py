@@ -71,20 +71,49 @@ def get_latest_gefs_run():
 
 def get_gefs_forecast_hours(
     run_time,
-    target_date
+    target_date,
+    not_before=None
 ):
+    """
+    Return GEFS forecast hours for the target date.
 
-    run_time = make_utc_timestamp(run_time)
+    If not_before is supplied, ignore forecast times
+    that have already occurred.
+    """
+
+    run_time = make_utc_timestamp(
+        run_time
+    )
 
     target_date = pd.Timestamp(
         target_date
     ).date()
 
+    if not_before is not None:
+        not_before = pd.Timestamp(
+            not_before
+        )
+
+        if not_before.tzinfo is None:
+            not_before = (
+                not_before.tz_localize(
+                    NYC_TIMEZONE
+                )
+            )
+        else:
+            not_before = (
+                not_before.tz_convert(
+                    NYC_TIMEZONE
+                )
+            )
+
     forecast_hours = []
 
-    # Plenty for the near-term markets we're
-    # currently trading.
-    for forecast_hour in range(0, 121, 3):
+    for forecast_hour in range(
+        0,
+        121,
+        3
+    ):
 
         valid_time_utc = (
             run_time
@@ -102,21 +131,38 @@ def get_gefs_forecast_hours(
         if (
             valid_time_local.date()
             == target_date
-            and 8
-            <= valid_time_local.hour
-            <= 23
         ):
-            forecast_hours.append(
-                forecast_hour
-            )
 
-        if valid_time_local.date() > target_date:
+            # For today's market, skip
+            # forecast times already in the past.
+            if (
+                not_before is not None
+                and valid_time_local
+                < not_before
+            ):
+                continue
+
+            # We only care about daytime/evening
+            # for the daily maximum.
+            if (
+                8
+                <= valid_time_local.hour
+                <= 23
+            ):
+                forecast_hours.append(
+                    forecast_hour
+                )
+
+        if (
+            valid_time_local.date()
+            > target_date
+        ):
             break
 
     if not forecast_hours:
         raise ValueError(
-            "GEFS run does not cover "
-            f"target date {target_date}."
+            "GEFS has no usable forecast hours "
+            f"for target date {target_date}."
         )
 
     return forecast_hours
@@ -248,12 +294,15 @@ def get_gefs_temperature(
 def get_gefs_member_high(
     run_time,
     target_date,
-    member
+    member,
+    not_before=None,
+    observed_high=None
 ):
     forecast_hours = (
         get_gefs_forecast_hours(
             run_time,
-            target_date
+            target_date,
+            not_before=not_before
         )
     )
 
@@ -267,19 +316,50 @@ def get_gefs_member_high(
             member
         )
 
-        readings.append(reading)
+        readings.append(
+            reading
+        )
 
     maximum = max(
         readings,
-        key=lambda x: x["temperature"]
+        key=lambda x:
+        x["temperature"]
     )
 
+    forecast_high = maximum[
+        "temperature"
+    ]
+
+    # If this is today, the final daily high
+    # can never be below what has already happened.
+    if observed_high is not None:
+
+        effective_high = max(
+            forecast_high,
+            observed_high
+        )
+
+    else:
+
+        effective_high = forecast_high
+
     return {
-        "member": get_member_name(member),
-        "max_temperature": (
-            maximum["temperature"]
+        "member": get_member_name(
+            member
         ),
-        "max_time": maximum["valid_time"],
+
+        # This is what our probability model uses.
+        "max_temperature": effective_high,
+
+        # Keep the raw remaining forecast for debugging.
+        "forecast_high": forecast_high,
+
+        "observed_floor": observed_high,
+
+        "max_time": maximum[
+            "valid_time"
+        ],
+
         "temperatures": readings
     }
 
@@ -287,7 +367,9 @@ def get_gefs_member_high(
 def get_gefs_ensemble(
     run_time,
     target_date,
-    members
+    members,
+    not_before=None,
+    observed_high=None
 ):
     results = []
 
@@ -307,7 +389,9 @@ def get_gefs_ensemble(
         result = get_gefs_member_high(
             run_time,
             target_date,
-            member
+            member,
+            not_before=not_before,
+            observed_high=observed_high
         )
 
         results.append(result)

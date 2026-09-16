@@ -1,7 +1,8 @@
 import numpy as np
 
 from src.weather.distribution import (
-    get_rounded_member_highs
+    get_rounded_member_highs,
+    calculate_smoothed_market_probability
 )
 
 
@@ -85,21 +86,36 @@ def calculate_market_edge(
     market,
     gefs_results
 ):
-    probability_result = (
-        calculate_market_probability(
+
+    raw_result = calculate_market_probability(
+        market,
+        gefs_results
+    )
+
+    raw_yes = raw_result[
+        "probability"
+    ]
+
+    smooth_result = (
+        calculate_smoothed_market_probability(
             market,
             gefs_results
         )
     )
 
-    model_yes = probability_result[
+    model_yes = smooth_result[
         "probability"
     ]
 
     model_no = 1.0 - model_yes
 
-    yes_ask = market["yes_ask"]
-    no_ask = market["no_ask"]
+    yes_ask = market[
+        "yes_ask"
+    ]
+
+    no_ask = market[
+        "no_ask"
+    ]
 
     yes_edge = (
         model_yes - yes_ask
@@ -110,39 +126,78 @@ def calculate_market_edge(
     )
 
     if yes_edge >= no_edge:
+
         best_side = "YES"
         best_edge = yes_edge
 
     else:
+
         best_side = "NO"
         best_edge = no_edge
 
     return {
-        "ticker": market["ticker"],
-        "title": market["title"],
+        "ticker": market[
+            "ticker"
+        ],
 
-        "strike_type": market["strike_type"],
-        "floor_strike": market["floor_strike"],
-        "cap_strike": market["cap_strike"],
+        "title": market[
+            "title"
+        ],
 
+        "strike_type": market[
+            "strike_type"
+        ],
+
+        "floor_strike": market[
+            "floor_strike"
+        ],
+
+        "cap_strike": market[
+            "cap_strike"
+        ],
+
+        # Raw 31-member GEFS probability
+        "raw_gefs_yes": raw_yes,
+
+        # Smoothed probability used for edge
         "model_yes": model_yes,
         "model_no": model_no,
 
-        "yes_count": probability_result[
+        # KDE smoothing amount
+        "bandwidth": smooth_result[
+            "bandwidth"
+        ],
+
+        # Raw ensemble information
+        "yes_count": raw_result[
             "yes_count"
         ],
-        "total_members": probability_result[
+
+        "total_members": raw_result[
             "total_members"
         ],
 
-        "yes_bid": market["yes_bid"],
-        "yes_ask": market["yes_ask"],
-        "no_bid": market["no_bid"],
-        "no_ask": market["no_ask"],
+        # Kalshi market prices
+        "yes_bid": market[
+            "yes_bid"
+        ],
+
+        "yes_ask": market[
+            "yes_ask"
+        ],
+
+        "no_bid": market[
+            "no_bid"
+        ],
+
+        "no_ask": market[
+            "no_ask"
+        ],
 
         "yes_midpoint": market[
             "yes_midpoint"
         ],
+
         "no_midpoint": market[
             "no_midpoint"
         ],
@@ -150,10 +205,12 @@ def calculate_market_edge(
         "yes_spread": market[
             "yes_spread"
         ],
+
         "no_spread": market[
             "no_spread"
         ],
 
+        # Model edge
         "yes_edge": yes_edge,
         "no_edge": no_edge,
 
