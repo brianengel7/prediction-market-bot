@@ -9,12 +9,17 @@ from src.database.db import (
 from src.weather.settlement import (
     get_kxhighny_settlement_window
 )
+import time
+import requests
 
 
 CENTRAL_PARK_LAT = 40.77898
 CENTRAL_PARK_LON = -73.96925
 NYC_TIMEZONE = ZoneInfo("America/New_York")
 GEFS_PRODUCT = "atmos.25"
+GEFS_MAX_RETRIES = 5
+GEFS_RETRY_BASE_SECONDS = 2
+GEFS_REQUEST_PAUSE_SECONDS = 0.10
 
 
 def make_utc_timestamp(timestamp):
@@ -203,9 +208,12 @@ def get_gefs_temperature(
         verbose=False
     )
 
-    data = gefs.xarray(
-        "TMP:2 m"
+    data = load_gefs_dataset(
+        run_time=run_time,
+        member=member,
+        forecast_hour=forecast_hour
     )
+
     nearest_point = data.sel(
         latitude=CENTRAL_PARK_LAT,
         longitude=CENTRAL_PARK_LON % 360,
@@ -441,3 +449,91 @@ def get_gefs_ensemble(
     }
 
     return summary
+
+def load_gefs_dataset(
+    run_time,
+    member,
+    forecast_hour
+):
+
+    run_time = pd.Timestamp(
+        run_time
+    )
+
+    if run_time.tzinfo is None:
+        run_time_utc = run_time.tz_localize(
+            "UTC"
+        )
+    else:
+        run_time_utc = run_time.tz_convert(
+            "UTC"
+        )
+
+    herbie_run_time = (
+        run_time_utc.tz_localize(None)
+    )
+
+    for attempt in range(
+        GEFS_MAX_RETRIES
+    ):
+        try:
+            gefs = Herbie(
+                herbie_run_time,
+                model="gefs",
+                product=GEFS_PRODUCT,
+                member=member,
+                fxx=forecast_hour
+            )
+
+            data = gefs.xarray(
+                "TMP:2 m"
+            )
+
+            time.sleep(
+                GEFS_REQUEST_PAUSE_SECONDS
+            )
+
+            return data
+
+        except Exception as error:
+
+            message = str(error)
+
+            retryable = (
+                isinstance(
+                    error,
+                    requests.exceptions.RequestException
+                )
+                or "503" in message
+                or "Slow Down" in message
+                or "429" in message
+                or "timeout" in message.lower()
+            )
+
+            if (
+                not retryable
+                or attempt
+                == GEFS_MAX_RETRIES - 1
+            ):
+                raise
+
+            delay = (
+                GEFS_RETRY_BASE_SECONDS
+                * (2 ** attempt)
+            )
+
+            print(
+                f"GEFS download failed "
+                f"(attempt {attempt + 1}/"
+                f"{GEFS_MAX_RETRIES}): "
+                f"{error}"
+            )
+
+            print(
+                f"Retrying in "
+                f"{delay} seconds..."
+            )
+
+            time.sleep(
+                delay
+            )
