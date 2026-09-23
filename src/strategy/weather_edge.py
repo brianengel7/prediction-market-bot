@@ -5,55 +5,102 @@ from src.weather.distribution import (
     calculate_smoothed_market_probability
 )
 
-PROBABILITY_MODEL_VERSION = (
-    "raw-gefs-atmos25-kde-v1"
+from src.weather.fair_distribution import (
+    probability_for_market
 )
+
+
+PROBABILITY_MODEL_VERSION = (
+    "calibrated-multimodel-normal-v1"
+)
+
 
 def calculate_market_probability(
     market,
     gefs_results
 ):
+    """
+    Raw GEFS member probability.
 
-    temperatures = get_rounded_member_highs(
-        gefs_results
+    This is retained as a diagnostic.
+    It is NOT the primary fair probability.
+    """
+
+    temperatures = (
+        get_rounded_member_highs(
+            gefs_results
+        )
     )
 
-    strike_type = market["strike_type"].lower()
+    strike_type = (
+        market[
+            "strike_type"
+        ].lower()
+    )
 
-    floor = market.get("floor_strike")
-    cap = market.get("cap_strike")
+    floor = market.get(
+        "floor_strike"
+    )
+
+    cap = market.get(
+        "cap_strike"
+    )
 
     if strike_type == "less":
 
         if cap is None:
+
             raise ValueError(
-                "Less market is missing cap_strike."
+                "Less market is "
+                "missing cap_strike."
             )
 
-        cap = float(cap)
+        cap = float(
+            cap
+        )
 
-        yes_mask = temperatures < cap
+        yes_mask = (
+            temperatures
+            < cap
+        )
 
     elif strike_type == "greater":
 
         if floor is None:
+
             raise ValueError(
-                "Greater market is missing floor_strike."
+                "Greater market is "
+                "missing floor_strike."
             )
 
-        floor = float(floor)
+        floor = float(
+            floor
+        )
 
-        yes_mask = temperatures > floor
+        yes_mask = (
+            temperatures
+            > floor
+        )
 
     elif strike_type == "between":
 
-        if floor is None or cap is None:
+        if (
+            floor is None
+            or cap is None
+        ):
+
             raise ValueError(
-                "Between market is missing a strike."
+                "Between market is "
+                "missing a strike."
             )
 
-        floor = float(floor)
-        cap = float(cap)
+        floor = float(
+            floor
+        )
+
+        cap = float(
+            cap
+        )
 
         yes_mask = (
             (temperatures >= floor)
@@ -62,42 +109,79 @@ def calculate_market_probability(
         )
 
     else:
+
         raise ValueError(
-            f"Unknown strike type: {strike_type}"
+            f"Unknown strike type: "
+            f"{strike_type}"
         )
 
     yes_count = int(
-        np.sum(yes_mask)
+        np.sum(
+            yes_mask
+        )
     )
 
     total_members = len(
         temperatures
     )
 
+    if total_members == 0:
+
+        raise ValueError(
+            "GEFS ensemble has "
+            "no members."
+        )
+
     probability = (
-        yes_count / total_members
+        yes_count
+        / total_members
     )
 
     return {
-        "probability": probability,
-        "yes_count": yes_count,
-        "total_members": total_members
+        "probability":
+            probability,
+
+        "yes_count":
+            yes_count,
+
+        "total_members":
+            total_members
     }
 
 
 def calculate_market_edge(
     market,
-    gefs_results
+    gefs_results,
+    calibration
 ):
+    """
+    Calculate market edge using the
+    calibrated multi-model probability.
 
-    raw_result = calculate_market_probability(
-        market,
-        gefs_results
+    GEFS raw/KDE values are retained
+    only as diagnostic information.
+    """
+
+    # --------------------------------------------------
+    # RAW GEFS DIAGNOSTIC
+    # --------------------------------------------------
+
+    raw_result = (
+        calculate_market_probability(
+            market,
+            gefs_results
+        )
     )
 
-    raw_yes = raw_result[
-        "probability"
-    ]
+    raw_gefs_yes = (
+        raw_result[
+            "probability"
+        ]
+    )
+
+    # --------------------------------------------------
+    # OLD GEFS KDE DIAGNOSTIC
+    # --------------------------------------------------
 
     smooth_result = (
         calculate_smoothed_market_probability(
@@ -106,128 +190,285 @@ def calculate_market_edge(
         )
     )
 
-    model_yes = smooth_result[
-        "probability"
-    ]
+    gefs_kde_yes = (
+        smooth_result[
+            "probability"
+        ]
+    )
 
-    model_no = 1.0 - model_yes
+    bandwidth = (
+        smooth_result[
+            "bandwidth"
+        ]
+    )
 
-    yes_ask = market[
+    # --------------------------------------------------
+    # PRIMARY CALIBRATED FAIR PROBABILITY
+    # --------------------------------------------------
+
+    strike_type = (
+        market[
+            "strike_type"
+        ].lower()
+    )
+
+    model_yes = (
+        probability_for_market(
+            strike_type=
+                strike_type,
+
+            floor_strike=
+                market.get(
+                    "floor_strike"
+                ),
+
+            cap_strike=
+                market.get(
+                    "cap_strike"
+                ),
+
+            point_forecast=
+                calibration[
+                    "point_forecast"
+                ],
+
+            residual_mean=
+                calibration[
+                    "residual_mean"
+                ],
+
+            residual_std=
+                calibration[
+                    "residual_std"
+                ]
+        )
+    )
+
+    model_no = (
+        1.0
+        - model_yes
+    )
+
+    # --------------------------------------------------
+    # MARKET PRICES
+    # --------------------------------------------------
+
+    yes_bid = market.get(
+        "yes_bid"
+    )
+
+    yes_ask = market.get(
         "yes_ask"
-    ]
+    )
 
-    no_ask = market[
+    no_bid = market.get(
+        "no_bid"
+    )
+
+    no_ask = market.get(
         "no_ask"
-    ]
-
-    yes_edge = (
-        model_yes - yes_ask
     )
 
-    no_edge = (
-        model_no - no_ask
-    )
+    # --------------------------------------------------
+    # EDGE
+    # --------------------------------------------------
 
-    if yes_edge >= no_edge:
+    yes_edge = None
+    no_edge = None
+
+    if yes_ask is not None:
+
+        yes_edge = (
+            model_yes
+            - yes_ask
+        )
+
+    if no_ask is not None:
+
+        no_edge = (
+            model_no
+            - no_ask
+        )
+
+    # --------------------------------------------------
+    # BEST TRADE SIDE
+    # --------------------------------------------------
+
+    if (
+        yes_edge is not None
+        and no_edge is not None
+    ):
+
+        if yes_edge >= no_edge:
+
+            best_side = "YES"
+            best_edge = yes_edge
+
+        else:
+
+            best_side = "NO"
+            best_edge = no_edge
+
+    elif yes_edge is not None:
 
         best_side = "YES"
         best_edge = yes_edge
 
-    else:
+    elif no_edge is not None:
 
         best_side = "NO"
         best_edge = no_edge
 
+    else:
+
+        best_side = None
+        best_edge = None
+
+    # --------------------------------------------------
+    # RESULT
+    # --------------------------------------------------
+
     return {
-        "ticker": market[
-            "ticker"
-        ],
+        "ticker":
+            market.get(
+                "ticker"
+            ),
 
-        "title": market[
-            "title"
-        ],
+        "title":
+            market.get(
+                "title"
+            ),
 
-        "strike_type": market[
-            "strike_type"
-        ],
+        "strike_type":
+            market.get(
+                "strike_type"
+            ),
 
-        "floor_strike": market[
-            "floor_strike"
-        ],
+        "floor_strike":
+            market.get(
+                "floor_strike"
+            ),
 
-        "cap_strike": market[
-            "cap_strike"
-        ],
+        "cap_strike":
+            market.get(
+                "cap_strike"
+            ),
 
-        # Raw 31-member GEFS probability
-        "raw_gefs_yes": raw_yes,
+        # ----------------------------------------------
+        # GEFS diagnostics
+        # ----------------------------------------------
 
-        # Smoothed probability used for edge
-        "model_yes": model_yes,
-        "model_no": model_no,
+        "raw_gefs_yes":
+            raw_gefs_yes,
 
-        # KDE smoothing amount
-        "bandwidth": smooth_result[
-            "bandwidth"
-        ],
+        "gefs_kde_yes":
+            gefs_kde_yes,
 
-        # Raw ensemble information
-        "yes_count": raw_result[
-            "yes_count"
-        ],
+        "bandwidth":
+            bandwidth,
 
-        "total_members": raw_result[
-            "total_members"
-        ],
+        "yes_count":
+            raw_result[
+                "yes_count"
+            ],
 
-        # Kalshi market prices
-        "yes_bid": market[
-            "yes_bid"
-        ],
+        "total_members":
+            raw_result[
+                "total_members"
+            ],
 
-        "yes_ask": market[
-            "yes_ask"
-        ],
+        # ----------------------------------------------
+        # Primary calibrated model
+        # ----------------------------------------------
 
-        "no_bid": market[
-            "no_bid"
-        ],
+        "model_yes":
+            model_yes,
 
-        "no_ask": market[
-            "no_ask"
-        ],
+        "model_no":
+            model_no,
 
-        "yes_midpoint": market[
-            "yes_midpoint"
-        ],
+        "fair_point_forecast":
+            calibration[
+                "point_forecast"
+            ],
 
-        "no_midpoint": market[
-            "no_midpoint"
-        ],
+        "residual_mean":
+            calibration[
+                "residual_mean"
+            ],
 
-        "yes_spread": market[
-            "yes_spread"
-        ],
+        "residual_std":
+            calibration[
+                "residual_std"
+            ],
 
-        "no_spread": market[
-            "no_spread"
-        ],
+        # ----------------------------------------------
+        # Kalshi prices
+        # ----------------------------------------------
 
-        # Model edge
-        "yes_edge": yes_edge,
-        "no_edge": no_edge,
+        "yes_bid":
+            yes_bid,
 
-        "best_side": best_side,
-        "best_edge": best_edge,
+        "yes_ask":
+            yes_ask,
 
-        "model_version": PROBABILITY_MODEL_VERSION
+        "no_bid":
+            no_bid,
+
+        "no_ask":
+            no_ask,
+
+        "yes_midpoint":
+            market.get(
+                "yes_midpoint"
+            ),
+
+        "no_midpoint":
+            market.get(
+                "no_midpoint"
+            ),
+
+        "yes_spread":
+            market.get(
+                "yes_spread"
+            ),
+
+        "no_spread":
+            market.get(
+                "no_spread"
+            ),
+
+        # ----------------------------------------------
+        # Edge
+        # ----------------------------------------------
+
+        "yes_edge":
+            yes_edge,
+
+        "no_edge":
+            no_edge,
+
+        "best_side":
+            best_side,
+
+        "best_edge":
+            best_edge,
+
+        "model_version":
+            PROBABILITY_MODEL_VERSION
     }
 
 
 def analyze_weather_markets(
     markets,
-    gefs_results
+    gefs_results,
+    calibration
 ):
+    """
+    Analyze all Kalshi weather markets
+    using the calibrated multi-model
+    fair probability.
+    """
 
     results = []
 
@@ -235,26 +476,44 @@ def analyze_weather_markets(
 
         try:
 
-            result = calculate_market_edge(
-                market,
-                gefs_results
+            result = (
+                calculate_market_edge(
+                    market=
+                        market,
+
+                    gefs_results=
+                        gefs_results,
+
+                    calibration=
+                        calibration
+                )
             )
 
-            results.append(result)
+            results.append(
+                result
+            )
 
         except ValueError as error:
 
             print(
                 f"Skipping "
-                f"{market['ticker']}: "
+                f"{market.get('ticker')}: "
                 f"{error}"
             )
 
-    # Highest raw model edge first.
+    # Highest calibrated edge first.
     results.sort(
-        key=lambda result: result[
-            "best_edge"
-        ],
+        key=lambda result: (
+            result[
+                "best_edge"
+            ]
+            if result[
+                "best_edge"
+            ] is not None
+            else float(
+                "-inf"
+            )
+        ),
         reverse=True
     )
 

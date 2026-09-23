@@ -6,11 +6,13 @@ from src.kalshi.markets import parse_markets
 from src.kalshi.events import get_weather_target_date
 from src.weather.hrrr import compare_hrrr_runs, get_recent_hrrr_runs
 from src.weather.gefs import get_latest_gefs_run, get_gefs_ensemble
-from src.strategy.weather_edge import analyze_weather_markets
 from src.database.db import save_model_snapshot, save_market_snapshots
 from src.weather.observations import get_observed_high
 from src.weather.client import get_nws_high_forecast
 from src.strategy.weather_edge import analyze_weather_markets, PROBABILITY_MODEL_VERSION
+from src.weather.live_bundle import (
+    get_live_forecast_bundle
+)
 
 
 def main():
@@ -131,60 +133,6 @@ def main():
         target_date
     )
 
-    # GEFS
-
-    target_date_obj = (
-        pd.Timestamp(
-            target_date
-        ).date()
-    )
-
-    now_nyc = pd.Timestamp.now(
-        tz=NYC_TIMEZONE
-    )
-
-    observed_high = None
-    not_before = None
-    observation_results = None
-
-    target_date_obj = pd.Timestamp(
-        target_date
-    ).date()
-
-    if target_date_obj == today:
-
-        observation_results = (
-            get_observed_high(
-                target_date
-            )
-        )
-
-        if observation_results is not None:
-
-            observed_high = (
-                observation_results[
-                    "observed_high"
-                ]
-            )
-            not_before = (
-                observation_results[
-                    "latest_time"
-                ]
-            )
-
-
-    gefs_run = get_latest_gefs_run()
-
-    members = range(0, 31)
-
-    gefs_results = get_gefs_ensemble(
-        run_time=gefs_run,
-        target_date=target_date,
-        members=members,
-        not_before=not_before,
-        observed_high=observed_high
-    )
-
     # Observations
 
     observation_results = (
@@ -195,9 +143,22 @@ def main():
 
     # RAW EDGE CALCULATION
 
+    bundle = get_live_forecast_bundle(
+        target_date
+    )
+
+    calibration = bundle[
+        "calibration"
+    ]
+
+    gefs_results = bundle[
+        "gefs"
+    ]
+
     edge_results = analyze_weather_markets(
         markets=markets,
-        gefs_results=gefs_results
+        gefs_results=gefs_results,
+        calibration=calibration
     )
 
     snapshot_time = save_model_snapshot(
@@ -238,7 +199,7 @@ def main():
     # GEFS SUMMARY
 
     print()
-    print("GEFS SUMMARY")
+    print("LATEST GEFS SUMMARY")
 
     print(
         f"Run: "
@@ -273,7 +234,7 @@ def main():
     # MODEL VS KALSHI
 
     print()
-    print("RAW GEFS MODEL VS KALSHI")
+    print("CALIBRATED MULTI-MODEL VS KALSHI")
 
     for result in edge_results:
 
@@ -281,25 +242,30 @@ def main():
         print(result["title"])
 
         print(
-            f"Raw GEFS:      "
-            f"{result['raw_gefs_yes']:6.2%} "
+            f"Raw GEFS:       "
+            f"{result['raw_gefs_yes'] * 100:.2f}% "
             f"({result['yes_count']}/"
             f"{result['total_members']})"
         )
 
         print(
-            f"Smoothed YES:  "
-            f"{result['model_yes']:6.2%}"
+            f"GEFS KDE:       "
+            f"{result['gefs_kde_yes'] * 100:.2f}%"
         )
 
         print(
-            f"Smoothed NO:   "
-            f"{result['model_no']:6.2%}"
+            f"Calibrated YES: "
+            f"{result['model_yes'] * 100:.2f}%"
         )
 
         print(
-            f"KDE bandwidth: "
-            f"{result['bandwidth']:.2f}°F"
+            f"Calibrated NO:  "
+            f"{result['model_no'] * 100:.2f}%"
+        )
+
+        print(
+            f"Fair high:      "
+            f"{result['fair_point_forecast']:.2f}°F"
         )
 
         print()
@@ -341,14 +307,14 @@ def main():
         if result["best_edge"] > 0:
 
             print(
-                f"RAW EDGE:   "
+                f"CALIBRATED EDGE: "
                 f"{result['best_side']} "
                 f"{result['best_edge']:+.2%}"
             )
 
         else:
 
-            print("RAW EDGE:   PASS")
+            print("CALIBRATED EDGE:   PASS")
 
     print()
     print("CENTRAL PARK OBSERVATIONS")
@@ -422,6 +388,30 @@ def main():
         print(
             "NWS high:    Not found"
         )
+
+    print()
+    print("CALIBRATED MODEL INPUTS")
+
+    for source, value in (
+        calibration[
+            "raw_forecasts"
+        ].items()
+    ):
+
+        print(
+            f"{source:10s}: "
+            f"{value:.2f}°F"
+        )
+
+    print(
+        f"Fair high:  "
+        f"{calibration['point_forecast']:.2f}°F"
+    )
+
+    print(
+        f"Uncertainty: "
+        f"{calibration['residual_std']:.2f}°F"
+    )
 
 if __name__ == "__main__":
     main()

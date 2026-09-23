@@ -44,7 +44,7 @@ def get_backtest_run_time(
 
 def backtest_gefs_date(
     target_date,
-    actual_high
+    actual_high=None
 ):
     target_date = pd.Timestamp(
         target_date
@@ -56,7 +56,9 @@ def backtest_gefs_date(
 
     print()
     print("=" * 60)
-    print(f"BACKTESTING {target_date}")
+    print(
+        f"GEFS FORECAST {target_date}"
+    )
     print(
         f"GEFS run: "
         f"{run_time:%Y-%m-%d %HZ}"
@@ -76,13 +78,34 @@ def backtest_gefs_date(
         "median_high"
     ]
 
-    mean_error = (
-        mean_high - actual_high
-    )
+    mean_error = None
+    median_error = None
+    mean_absolute_error = None
+    mean_squared_error = None
 
-    median_error = (
-        median_high - actual_high
-    )
+    if actual_high is not None:
+
+        actual_high = float(
+            actual_high
+        )
+
+        mean_error = (
+            mean_high
+            - actual_high
+        )
+
+        median_error = (
+            median_high
+            - actual_high
+        )
+
+        mean_absolute_error = abs(
+            mean_error
+        )
+
+        mean_squared_error = (
+            mean_error ** 2
+        )
 
     print(
         f"GEFS mean:   "
@@ -95,94 +118,70 @@ def backtest_gefs_date(
     )
 
     print(
-        f"Actual:      "
-        f"{actual_high:.2f}°F"
-    )
-
-    print(
-        f"Mean error:  "
-        f"{mean_error:+.2f}°F"
-    )
-
-    print(
         f"Spread:      "
         f"{result['std_high']:.2f}°F"
     )
 
+    if actual_high is not None:
+
+        print(
+            f"Actual:      "
+            f"{actual_high:.2f}°F"
+        )
+
+        print(
+            f"Mean error:  "
+            f"{mean_error:+.2f}°F"
+        )
+
     return {
-        "date": target_date,
-        "run_time": run_time,
+        "date":
+            target_date,
 
-        "mean_high": mean_high,
-        "median_high": median_high,
-        "std_high": result[
-            "std_high"
-        ],
+        "run_time":
+            run_time,
 
-        "min_high": result[
-            "min_high"
-        ],
+        "mean_high":
+            mean_high,
 
-        "max_high": result[
-            "max_high"
-        ],
+        "median_high":
+            median_high,
 
-        "actual_high": actual_high,
+        "std_high":
+            result[
+                "std_high"
+            ],
 
-        "mean_error": mean_error,
+        "min_high":
+            result[
+                "min_high"
+            ],
+
+        "max_high":
+            result[
+                "max_high"
+            ],
+
+        "actual_high":
+            actual_high,
+
+        "mean_error":
+            mean_error,
 
         "mean_absolute_error":
-            abs(mean_error),
+            mean_absolute_error,
 
         "mean_squared_error":
-            mean_error ** 2,
+            mean_squared_error,
 
         "median_error":
             median_error,
 
-        "members": result[
-            "members"
-        ]
+        "members":
+            result[
+                "members"
+            ]
     }
-
-
-def backtest_gefs_range(
-    start_date,
-    end_date
-):
-    actuals = get_actual_highs(
-        start_date,
-        end_date
-    )
-
-    results = []
-
-    for actual in actuals:
-
-        try:
-            result = backtest_gefs_date(
-                target_date=actual[
-                    "date"
-                ],
-                actual_high=actual[
-                    "actual_high"
-                ]
-            )
-
-            results.append(
-                result
-            )
-
-        except Exception as error:
-
-            print(
-                f"FAILED "
-                f"{actual['date']}: "
-                f"{error}"
-            )
-
-    return results
-
 
 def calculate_gefs_metrics(
     results

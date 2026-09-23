@@ -55,12 +55,8 @@ def get_backtest_run_time(
 
 def backtest_hrrr_date(
     target_date,
-    actual_high
+    actual_high=None
 ):
-    """
-    Backtest one date using a fixed HRRR run.
-    """
-
     target_date = pd.Timestamp(
         target_date
     ).date()
@@ -70,12 +66,9 @@ def backtest_hrrr_date(
     )
 
     print()
+    print("=" * 60)
     print(
-        "=" * 60
-    )
-
-    print(
-        f"BACKTESTING {target_date}"
+        f"HRRR FORECAST {target_date}"
     )
 
     print(
@@ -88,39 +81,66 @@ def backtest_hrrr_date(
         target_date=target_date
     )
 
-    forecast_high = result[
-        "max_temperature"
-    ]
+    if not result:
 
-    error = (
-        forecast_high
-        - actual_high
+        raise ValueError(
+            f"No HRRR result found "
+            f"for {target_date}"
+        )
+
+    forecast_high = float(
+        result[
+            "max_temperature"
+        ]
     )
 
-    absolute_error = abs(
-        error
-    )
+    error = None
+    absolute_error = None
+    squared_error = None
 
-    squared_error = (
-        error ** 2
-    )
+    if actual_high is not None:
 
+        actual_high = float(
+            actual_high
+        )
+
+        error = (
+            forecast_high
+            - actual_high
+        )
+
+        absolute_error = abs(
+            error
+        )
+
+        squared_error = (
+            error ** 2
+        )
+
+    print()
     print(
-        f"Forecast: {forecast_high:.2f}°F"
+        f"HRRR high: "
+        f"{forecast_high:.2f}°F"
     )
 
-    print(
-        f"Actual:   {actual_high:.2f}°F"
-    )
+    if actual_high is not None:
 
-    print(
-        f"Error:    {error:+.2f}°F"
-    )
+        print(
+            f"Actual:    "
+            f"{actual_high:.2f}°F"
+        )
+
+        print(
+            f"Error:     "
+            f"{error:+.2f}°F"
+        )
 
     return {
-        "date": target_date,
+        "date":
+            target_date,
 
-        "run_time": run_time,
+        "run_time":
+            run_time,
 
         "forecast_high":
             forecast_high,
@@ -137,10 +157,9 @@ def backtest_hrrr_date(
         "squared_error":
             squared_error,
 
-        "forecast_high_time":
-            result["max_time"]
+        "hrrr_result":
+            result
     }
-
 
 def backtest_hrrr_range(
     start_date,
