@@ -6,7 +6,7 @@ from src.kalshi.markets import parse_markets
 from src.kalshi.events import get_weather_target_date
 from src.weather.hrrr import compare_hrrr_runs, get_recent_hrrr_runs
 from src.weather.gefs import get_latest_gefs_run, get_gefs_ensemble
-from src.database.db import save_model_snapshot, save_market_snapshots
+from src.database.db import save_model_snapshot, save_market_snapshots, save_weather_fair_values
 from src.weather.observations import get_observed_high
 from src.weather.client import get_nws_high_forecast
 from src.strategy.weather_edge import analyze_weather_markets, PROBABILITY_MODEL_VERSION
@@ -159,6 +159,22 @@ def main():
         markets=markets,
         gefs_results=gefs_results,
         calibration=calibration
+    )
+
+    fair_values_saved = (
+        save_weather_fair_values(
+            target_date=
+                target_date,
+
+            edge_results=
+                edge_results,
+
+            calibration=
+                calibration,
+
+            model_version=
+                PROBABILITY_MODEL_VERSION
+        )
     )
 
     snapshot_time = save_model_snapshot(
@@ -411,6 +427,13 @@ def main():
     print(
         f"Uncertainty: "
         f"{calibration['residual_std']:.2f}°F"
+    )
+
+    print()
+    print(
+        f"Saved {fair_values_saved} "
+        f"Weather MultiModel v1 "
+        f"fair values."
     )
 
 if __name__ == "__main__":

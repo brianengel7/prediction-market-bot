@@ -195,6 +195,109 @@ def initialize_database():
             """
         )
 
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_edge_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                snapshot_time TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+
+                ticker TEXT NOT NULL,
+
+                yes_bid REAL,
+                yes_ask REAL,
+                no_bid REAL,
+                no_ask REAL,
+
+                model_yes REAL NOT NULL,
+                model_no REAL NOT NULL,
+
+                yes_edge REAL,
+                no_edge REAL,
+
+                best_side TEXT,
+                best_edge REAL,
+
+                model_version TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weather_fair_values (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                created_at TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+
+                ticker TEXT NOT NULL,
+                title TEXT,
+
+                strike_type TEXT,
+                floor_strike REAL,
+                cap_strike REAL,
+
+                model_yes REAL NOT NULL,
+                model_no REAL NOT NULL,
+
+                fair_point_forecast REAL NOT NULL,
+                residual_mean REAL NOT NULL,
+                residual_std REAL NOT NULL,
+
+                model_version TEXT NOT NULL,
+
+                UNIQUE (
+                    target_date,
+                    ticker,
+                    model_version
+                )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_market_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                target_date TEXT NOT NULL,
+                event_ticker TEXT NOT NULL,
+
+                ticker TEXT NOT NULL,
+                title TEXT,
+
+                strike_type TEXT,
+                floor_strike REAL,
+                cap_strike REAL,
+
+                market_status TEXT,
+                result TEXT,
+                settlement_value REAL,
+
+                decision_time TEXT NOT NULL,
+                entry_time TEXT NOT NULL,
+
+                yes_bid REAL,
+                yes_ask REAL,
+                no_bid REAL,
+                no_ask REAL,
+
+                market_source TEXT,
+                candle_source TEXT,
+
+                created_at TEXT NOT NULL,
+
+                UNIQUE (
+                    target_date,
+                    ticker,
+                    decision_time
+                )
+            )
+            """
+        )
+
 
 def get_cached_temperature(
     model,
@@ -480,73 +583,30 @@ def save_market_snapshots(
                     snapshot_time,
                     str(target_date),
 
-                    result[
-                        "ticker"
-                    ],
+                    result["ticker"],
+                    result.get("title"),
 
-                    result[
-                        "title"
-                    ],
+                    result.get("strike_type"),
+                    result.get("floor_strike"),
+                    result.get("cap_strike"),
 
-                    result[
-                        "strike_type"
-                    ],
+                    result.get("raw_gefs_yes"),
 
-                    result[
-                        "floor_strike"
-                    ],
+                    result["model_yes"],
+                    result["model_no"],
 
-                    result[
-                        "cap_strike"
-                    ],
+                    result.get("bandwidth"),
 
-                    result[
-                        "raw_gefs_yes"
-                    ],
+                    result.get("yes_bid"),
+                    result.get("yes_ask"),
+                    result.get("no_bid"),
+                    result.get("no_ask"),
 
-                    result[
-                        "model_yes"
-                    ],
+                    result.get("yes_edge"),
+                    result.get("no_edge"),
 
-                    result[
-                        "model_no"
-                    ],
-
-                    result[
-                        "bandwidth"
-                    ],
-
-                    result[
-                        "yes_bid"
-                    ],
-
-                    result[
-                        "yes_ask"
-                    ],
-
-                    result[
-                        "no_bid"
-                    ],
-
-                    result[
-                        "no_ask"
-                    ],
-
-                    result[
-                        "yes_edge"
-                    ],
-
-                    result[
-                        "no_edge"
-                    ],
-
-                    result[
-                        "best_side"
-                    ],
-
-                    result[
-                        "best_edge"
-                    ],
+                    result.get("best_side"),
+                    result.get("best_edge"),
 
                     result["model_version"]
                 )
@@ -846,6 +906,601 @@ def save_weather_model_backtest(
                 created_at
             )
         )
+
+def save_weather_fair_values(
+    target_date,
+    edge_results,
+    calibration,
+    model_version
+):
+    created_at = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).isoformat()
+    )
+
+    point_forecast = float(
+        calibration[
+            "point_forecast"
+        ]
+    )
+
+    residual_mean = float(
+        calibration[
+            "residual_mean"
+        ]
+    )
+
+    residual_std = float(
+        calibration[
+            "residual_std"
+        ]
+    )
+
+    saved_count = 0
+
+    with get_connection() as connection:
+
+        for result in edge_results:
+
+            connection.execute(
+                """
+                INSERT INTO weather_fair_values (
+                    created_at,
+                    target_date,
+
+                    ticker,
+                    title,
+
+                    strike_type,
+                    floor_strike,
+                    cap_strike,
+
+                    model_yes,
+                    model_no,
+
+                    fair_point_forecast,
+                    residual_mean,
+                    residual_std,
+
+                    model_version
+                )
+
+                VALUES (
+                    ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?
+                )
+
+                ON CONFLICT (
+                    target_date,
+                    ticker,
+                    model_version
+                )
+
+                DO UPDATE SET
+                    created_at =
+                        excluded.created_at,
+
+                    title =
+                        excluded.title,
+
+                    strike_type =
+                        excluded.strike_type,
+
+                    floor_strike =
+                        excluded.floor_strike,
+
+                    cap_strike =
+                        excluded.cap_strike,
+
+                    model_yes =
+                        excluded.model_yes,
+
+                    model_no =
+                        excluded.model_no,
+
+                    fair_point_forecast =
+                        excluded.fair_point_forecast,
+
+                    residual_mean =
+                        excluded.residual_mean,
+
+                    residual_std =
+                        excluded.residual_std
+                """,
+                (
+                    created_at,
+                    str(
+                        target_date
+                    ),
+
+                    result[
+                        "ticker"
+                    ],
+
+                    result[
+                        "title"
+                    ],
+
+                    result[
+                        "strike_type"
+                    ],
+
+                    result[
+                        "floor_strike"
+                    ],
+
+                    result[
+                        "cap_strike"
+                    ],
+
+                    float(
+                        result[
+                            "model_yes"
+                        ]
+                    ),
+
+                    float(
+                        result[
+                            "model_no"
+                        ]
+                    ),
+
+                    point_forecast,
+                    residual_mean,
+                    residual_std,
+
+                    model_version
+                )
+            )
+
+            saved_count += 1
+
+    return saved_count
+
+def get_weather_fair_values(
+    target_date,
+    model_version
+):
+    with get_connection() as connection:
+
+        query = """
+        SELECT
+            ticker,
+            title,
+            strike_type,
+            floor_strike,
+            cap_strike,
+            model_yes,
+            model_no,
+            fair_point_forecast,
+            residual_mean,
+            residual_std,
+            created_at
+
+        FROM weather_fair_values
+
+        WHERE target_date = ?
+          AND model_version = ?
+        """
+
+        dataframe = pd.read_sql_query(
+            query,
+            connection,
+            params=(
+                str(
+                    target_date
+                ),
+                model_version
+            )
+        )
+
+    return dataframe
+
+def get_market_snapshots(
+    target_date=None,
+    model_version=None
+):
+    with get_connection() as connection:
+
+        query = """
+        SELECT
+            snapshot_time,
+            target_date,
+
+            ticker,
+            title,
+
+            strike_type,
+            floor_strike,
+            cap_strike,
+
+            model_yes,
+            model_no,
+
+            yes_bid,
+            yes_ask,
+            no_bid,
+            no_ask,
+
+            yes_edge,
+            no_edge,
+
+            best_side,
+            best_edge,
+
+            model_version
+
+        FROM market_snapshots
+        """
+
+        conditions = []
+        params = []
+
+        if target_date is not None:
+
+            conditions.append(
+                "target_date = ?"
+            )
+
+            params.append(
+                str(target_date)
+            )
+
+        if model_version is not None:
+
+            conditions.append(
+                "model_version = ?"
+            )
+
+            params.append(
+                model_version
+            )
+
+        if conditions:
+
+            query += (
+                " WHERE "
+                + " AND ".join(
+                    conditions
+                )
+            )
+
+        query += """
+        ORDER BY
+            snapshot_time ASC,
+            ticker ASC
+        """
+
+        dataframe = pd.read_sql_query(
+            query,
+            connection,
+            params=params
+        )
+
+    if not dataframe.empty:
+
+        dataframe[
+            "snapshot_time"
+        ] = pd.to_datetime(
+            dataframe[
+                "snapshot_time"
+            ],
+            utc=True
+        )
+
+    return dataframe
+
+def save_historical_market_entries(
+    entries
+):
+
+    if not entries:
+        return 0
+
+    created_at = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).isoformat()
+    )
+
+    saved_count = 0
+
+    with get_connection() as connection:
+
+        for entry in entries:
+
+            settlement_value = (
+                entry.get(
+                    "settlement_value"
+                )
+            )
+
+            if settlement_value in (
+                None,
+                ""
+            ):
+                settlement_value = None
+
+            else:
+                settlement_value = float(
+                    settlement_value
+                )
+
+            connection.execute(
+                """
+                INSERT INTO historical_market_entries (
+                    target_date,
+                    event_ticker,
+
+                    ticker,
+                    title,
+
+                    strike_type,
+                    floor_strike,
+                    cap_strike,
+
+                    market_status,
+                    result,
+                    settlement_value,
+
+                    decision_time,
+                    entry_time,
+
+                    yes_bid,
+                    yes_ask,
+                    no_bid,
+                    no_ask,
+
+                    market_source,
+                    candle_source,
+
+                    created_at
+                )
+
+                VALUES (
+                    ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?,
+                    ?
+                )
+
+                ON CONFLICT (
+                    target_date,
+                    ticker,
+                    decision_time
+                )
+
+                DO UPDATE SET
+                    event_ticker =
+                        excluded.event_ticker,
+
+                    title =
+                        excluded.title,
+
+                    strike_type =
+                        excluded.strike_type,
+
+                    floor_strike =
+                        excluded.floor_strike,
+
+                    cap_strike =
+                        excluded.cap_strike,
+
+                    market_status =
+                        excluded.market_status,
+
+                    result =
+                        excluded.result,
+
+                    settlement_value =
+                        excluded.settlement_value,
+
+                    entry_time =
+                        excluded.entry_time,
+
+                    yes_bid =
+                        excluded.yes_bid,
+
+                    yes_ask =
+                        excluded.yes_ask,
+
+                    no_bid =
+                        excluded.no_bid,
+
+                    no_ask =
+                        excluded.no_ask,
+
+                    market_source =
+                        excluded.market_source,
+
+                    candle_source =
+                        excluded.candle_source,
+
+                    created_at =
+                        excluded.created_at
+                """,
+                (
+                    entry[
+                        "target_date"
+                    ],
+
+                    entry[
+                        "event_ticker"
+                    ],
+
+                    entry[
+                        "ticker"
+                    ],
+
+                    entry.get(
+                        "title"
+                    ),
+
+                    entry.get(
+                        "strike_type"
+                    ),
+
+                    entry.get(
+                        "floor_strike"
+                    ),
+
+                    entry.get(
+                        "cap_strike"
+                    ),
+
+                    entry.get(
+                        "market_status"
+                    ),
+
+                    entry.get(
+                        "result"
+                    ),
+
+                    settlement_value,
+
+                    str(
+                        entry[
+                            "decision_time"
+                        ]
+                    ),
+
+                    str(
+                        entry[
+                            "entry_time"
+                        ]
+                    ),
+
+                    entry.get(
+                        "yes_bid"
+                    ),
+
+                    entry.get(
+                        "yes_ask"
+                    ),
+
+                    entry.get(
+                        "no_bid"
+                    ),
+
+                    entry.get(
+                        "no_ask"
+                    ),
+
+                    entry.get(
+                        "market_source"
+                    ),
+
+                    entry.get(
+                        "candle_source"
+                    ),
+
+                    created_at
+                )
+            )
+
+            saved_count += 1
+
+    return saved_count
+
+def get_historical_market_entries(
+    start_date=None,
+    end_date=None,
+    target_date=None
+):
+
+    query = """
+        SELECT *
+
+        FROM historical_market_entries
+    """
+
+    conditions = []
+    params = []
+
+    if target_date is not None:
+
+        conditions.append(
+            "target_date = ?"
+        )
+
+        params.append(
+            str(target_date)
+        )
+
+    if start_date is not None:
+
+        conditions.append(
+            "target_date >= ?"
+        )
+
+        params.append(
+            str(start_date)
+        )
+
+    if end_date is not None:
+
+        conditions.append(
+            "target_date <= ?"
+        )
+
+        params.append(
+            str(end_date)
+        )
+
+    if conditions:
+
+        query += (
+            " WHERE "
+            + " AND ".join(
+                conditions
+            )
+        )
+
+    query += """
+        ORDER BY
+            target_date,
+            entry_time,
+            ticker
+    """
+
+    with get_connection() as connection:
+
+        dataframe = pd.read_sql_query(
+            query,
+            connection,
+            params=params
+        )
+
+    if not dataframe.empty:
+
+        dataframe[
+            "decision_time"
+        ] = pd.to_datetime(
+            dataframe[
+                "decision_time"
+            ],
+            utc=True
+        )
+
+        dataframe[
+            "entry_time"
+        ] = pd.to_datetime(
+            dataframe[
+                "entry_time"
+            ],
+            utc=True
+        )
+
+    return dataframe
 
 initialize_database()
 

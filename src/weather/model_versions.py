@@ -1,0 +1,7 @@
+WEATHER_MODEL_VERSION = (
+    "weather-nyc-d1-12z-multimodel-v1"
+)
+
+WEATHER_STATION = "KNYC"
+
+WEATHER_FORECAST_HORIZON = "D-1_12Z"

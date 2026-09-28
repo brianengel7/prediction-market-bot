@@ -180,14 +180,28 @@ def backtest_weather_range(
     return results
 
 
+# if __name__ == "__main__":
+
+#     results = backtest_weather_range(
+#         "2026-06-11",
+#         "2026-09-10"
+#     )
+
+#     print()
+#     print(
+#         f"Completed "
+#         f"{len(results)} dates."
+#     )
+
 if __name__ == "__main__":
 
     results = backtest_weather_range(
-        "2026-06-11",
-        "2026-09-10"
+        "2026-09-11",
+        "2026-09-26"
     )
 
     print()
+
     print(
         f"Completed "
         f"{len(results)} dates."

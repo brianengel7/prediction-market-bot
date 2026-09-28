@@ -10,8 +10,13 @@ from src.weather.fair_distribution import (
 )
 
 
+from src.weather.model_versions import (
+    WEATHER_MODEL_VERSION
+)
+
+
 PROBABILITY_MODEL_VERSION = (
-    "calibrated-multimodel-normal-v1"
+    WEATHER_MODEL_VERSION
 )
 
 

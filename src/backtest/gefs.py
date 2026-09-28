@@ -183,29 +183,84 @@ def backtest_gefs_date(
             ]
     }
 
+def backtest_gefs_range(
+    start_date,
+    end_date
+):
+    """
+    Backtest GEFS over a range of dates.
+    """
+
+    actuals = get_actual_highs(
+        start_date,
+        end_date
+    )
+
+    results = []
+
+    for actual in actuals:
+
+        target_date = actual[
+            "date"
+        ]
+
+        actual_high = actual[
+            "actual_high"
+        ]
+
+        try:
+
+            result = backtest_gefs_date(
+                target_date=target_date,
+                actual_high=actual_high
+            )
+
+            results.append(
+                result
+            )
+
+        except Exception as error:
+
+            print(
+                f"FAILED {target_date}: "
+                f"{error}"
+            )
+
+    return results
+
 def calculate_gefs_metrics(
     results
 ):
-    if not results:
+    valid_results = [
+        result
+        for result in results
+        if result[
+            "mean_error"
+        ] is not None
+    ]
+
+    if not valid_results:
         return None
 
     errors = [
-        result["mean_error"]
-        for result in results
+        result[
+            "mean_error"
+        ]
+        for result in valid_results
     ]
 
     absolute_errors = [
         result[
             "mean_absolute_error"
         ]
-        for result in results
+        for result in valid_results
     ]
 
     squared_errors = [
         result[
             "mean_squared_error"
         ]
-        for result in results
+        for result in valid_results
     ]
 
     bias = (
@@ -229,21 +284,31 @@ def calculate_gefs_metrics(
 
     average_spread = (
         sum(
-            result["std_high"]
-            for result in results
+            result[
+                "std_high"
+            ]
+            for result
+            in valid_results
         )
-        / len(results)
+        / len(valid_results)
     )
 
     return {
-        "count": len(results),
-        "bias": bias,
-        "mae": mae,
-        "rmse": rmse,
+        "count":
+            len(valid_results),
+
+        "bias":
+            bias,
+
+        "mae":
+            mae,
+
+        "rmse":
+            rmse,
+
         "average_spread":
             average_spread
     }
-
 
 if __name__ == "__main__":
 
