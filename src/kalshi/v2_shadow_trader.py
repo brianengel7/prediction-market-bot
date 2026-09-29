@@ -16,6 +16,10 @@ from src.kalshi.fees import (
     calculate_taker_fee
 )
 
+from src.kalshi.live_executor import (
+    execute_live_trade
+)
+
 
 # ============================================================
 # FROZEN STRATEGY
@@ -530,8 +534,16 @@ def inside_save_window():
 # ============================================================
 
 def run_shadow_trader(
-    save=False
+    save=False,
+    live=False
 ):
+    if live and not save:
+
+        raise RuntimeError(
+            "--live requires --save. "
+            "A real order cannot be submitted "
+            "without saving the shadow decision."
+        )
 
     event_info = (
         get_current_weather_event()
@@ -738,6 +750,42 @@ def run_shadow_trader(
         "SHADOW TRADE SAVED."
     )
 
+    # ========================================================
+    # OPTIONAL REAL-MONEY EXECUTION
+    # ========================================================
+
+    if live:
+
+        print()
+        print("=" * 80)
+        print(
+            "LIVE EXECUTION REQUESTED"
+        )
+        print("=" * 80)
+
+        live_result = (
+            execute_live_trade(
+                trade=
+                    best,
+
+                strategy=
+                    "NBM",
+
+                contracts=
+                    1
+            )
+        )
+
+        print()
+        print(
+            "REAL ORDER SUBMITTED."
+        )
+
+        print(
+            f"Kalshi order ID: "
+            f"{live_result.get('order_id')}"
+        )
+
     return best
 
 
@@ -758,9 +806,21 @@ if __name__ == "__main__":
         )
     )
 
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Submit a qualifying shadow trade "
+            "as a real Kalshi order."
+        )
+    )
+
     args = parser.parse_args()
 
     run_shadow_trader(
         save=
-            args.save
+            args.save,
+
+        live=
+            args.live
     )

@@ -406,6 +406,50 @@ def initialize_database():
             """
         )
 
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_orders (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                created_at TEXT NOT NULL,
+
+                strategy TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+
+                decision_time TEXT NOT NULL,
+
+                entry_price REAL NOT NULL,
+                net_edge REAL NOT NULL,
+
+                contracts REAL NOT NULL,
+
+                client_order_id TEXT NOT NULL,
+                kalshi_order_id TEXT,
+
+                order_status TEXT NOT NULL,
+
+                fill_count REAL,
+                remaining_count REAL,
+
+                average_fill_price REAL,
+                average_fee_paid REAL,
+
+                error_message TEXT,
+
+                settled INTEGER NOT NULL DEFAULT 0,
+                won INTEGER,
+                payout REAL,
+                net_pnl REAL,
+
+                UNIQUE(client_order_id)
+            )
+            """
+        )
+
 
 def get_cached_temperature(
     model,
@@ -2087,6 +2131,176 @@ def update_v2_market_only_shadow_settlement(
                 float(net_pnl),
                 int(decision_id)
             )
+        )
+
+def save_live_order(
+    order
+):
+
+    created_at = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).isoformat()
+    )
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            INSERT INTO live_orders (
+
+                created_at,
+
+                strategy,
+                target_date,
+
+                ticker,
+                side,
+
+                decision_time,
+
+                entry_price,
+                net_edge,
+
+                contracts,
+
+                client_order_id,
+                kalshi_order_id,
+
+                order_status,
+
+                fill_count,
+                remaining_count,
+
+                average_fill_price,
+                average_fee_paid,
+
+                error_message
+            )
+
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?
+            )
+
+            ON CONFLICT(client_order_id)
+
+            DO UPDATE SET
+
+                kalshi_order_id =
+                    excluded.kalshi_order_id,
+
+                order_status =
+                    excluded.order_status,
+
+                fill_count =
+                    excluded.fill_count,
+
+                remaining_count =
+                    excluded.remaining_count,
+
+                average_fill_price =
+                    excluded.average_fill_price,
+
+                average_fee_paid =
+                    excluded.average_fee_paid,
+
+                error_message =
+                    excluded.error_message
+            """,
+
+            (
+                created_at,
+
+                order[
+                    "strategy"
+                ],
+
+                str(
+                    order[
+                        "target_date"
+                    ]
+                ),
+
+                order[
+                    "ticker"
+                ],
+
+                order[
+                    "side"
+                ],
+
+                str(
+                    order[
+                        "decision_time"
+                    ]
+                ),
+
+                float(
+                    order[
+                        "entry_price"
+                    ]
+                ),
+
+                float(
+                    order[
+                        "net_edge"
+                    ]
+                ),
+
+                float(
+                    order[
+                        "contracts"
+                    ]
+                ),
+
+                order[
+                    "client_order_id"
+                ],
+
+                order.get(
+                    "kalshi_order_id"
+                ),
+
+                order[
+                    "order_status"
+                ],
+
+                order.get(
+                    "fill_count"
+                ),
+
+                order.get(
+                    "remaining_count"
+                ),
+
+                order.get(
+                    "average_fill_price"
+                ),
+
+                order.get(
+                    "average_fee_paid"
+                ),
+
+                order.get(
+                    "error_message"
+                )
+            )
+        )
+
+
+def get_live_orders():
+
+    with get_connection() as connection:
+
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM live_orders
+            ORDER BY created_at
+            """,
+            connection
         )
 
 initialize_database()
