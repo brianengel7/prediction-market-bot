@@ -129,7 +129,8 @@ def get_contract_settlement(
     for _, row in (
         matches.iterrows()
     ):
-
+        if str(row.get("market_status") or "").strip().lower() != "finalized":
+            continue
         market_result = (
             parse_market_result(
                 row

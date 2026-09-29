@@ -11,6 +11,7 @@ from src.kalshi.trading_client import (
     summarize_order_fills,
     get_market_settlement
 )
+from src.kalshi.live_executor import recover_unknown_submission
 import pandas as pd
 
 
@@ -212,6 +213,14 @@ def retry_fill_reconciliation(
 
         return None
 
+    if known_fill and reconciled_count + 1e-9 < float(fill_count):
+        print(
+            f"{order['ticker']}: "
+            f"waiting for all {float(fill_count):g} "
+            f"known fill(s); Kalshi returned {reconciled_count:g}."
+        )
+        return None
+
     reconciled_price = (
         summary[
             "average_fill_price"
@@ -365,6 +374,57 @@ def settle_live_orders(
     pending_count = 0
 
     for _, order in unsettled.iterrows():
+        
+        status = str(order.get("order_status") or "").strip().upper()
+        remaining = order.get("remaining_count")
+        pending_remainder = (
+            not is_missing_number(remaining)
+            and float(remaining) > 0
+        )
+
+        needs_order_lookup = (
+            status in ("SUBMITTING", "SUBMISSION_UNKNOWN", "ACCEPTED_PENDING")
+            or status.startswith("RECOVERED_")
+            or (
+                pending_remainder
+                and status in (
+                    "UNFILLED",
+                    "ACCEPTED_UNRECONCILED",
+                    "PARTIAL",
+                    "PARTIAL_UNRECONCILED",
+                )
+            )
+        )
+
+        if needs_order_lookup:
+            try:
+                recovered = recover_unknown_submission(
+                    trade=order,
+                    strategy=order["strategy"],
+                    contracts=order["contracts"],
+                    client_order_id=order["client_order_id"],
+                    save=save,
+                )
+            except Exception as error:
+                print(f"{order['ticker']}: recovery retry failed: {error}")
+                pending_count += 1
+                continue
+
+            if recovered is None:
+                print(f"{order['ticker']}: submission still unconfirmed.")
+                pending_count += 1
+                continue
+
+            order = order.copy()
+            for local_key, recovered_key in (
+                ("kalshi_order_id", "order_id"),
+                ("fill_count", "fill_count"),
+                ("remaining_count", "remaining_count"),
+                ("average_fill_price", "average_fill_price"),
+                ("average_fee_paid", "average_fee_paid"),
+                ("order_status", "order_status"),
+            ):
+                order[local_key] = recovered.get(recovered_key)
 
         reconciliation = (
             retry_fill_reconciliation(

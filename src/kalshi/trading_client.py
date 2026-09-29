@@ -529,9 +529,20 @@ def place_order(
             f"{response.text}"
         )
 
-    result = (
-        response.json()
-    )
+    try:
+        result = response.json()
+        if (
+            not isinstance(result, dict)
+            or not result.get("order_id")
+            or result.get("fill_count") is None
+            or result.get("remaining_count") is None
+        ):
+            raise ValueError("HTTP 201 response is missing order fields")
+    except (ValueError, TypeError) as error:
+        raise OrderSubmissionUnknownError(
+            "Kalshi returned HTTP 201, but its order response "
+            "could not be verified. Check client_order_id before retrying."
+        ) from error
 
     return {
         "request":
@@ -608,58 +619,47 @@ def get_orders(
         ORDERS_PATH
     )
 
-    params = {
-        "limit":
-            limit
-    }
+    all_orders = []
+    cursor = None
+    seen_cursors = set()
 
-    if ticker:
+    while True:
+        params = {"limit": limit}
 
-        params[
-            "ticker"
-        ] = ticker
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
 
-    if status:
-
-        params[
-            "status"
-        ] = status
-
-    headers = (
-        build_auth_headers(
-            method="GET",
-            url=url
-        )
-    )
-
-    response = (
-        requests.get(
+        response = requests.get(
             url,
-            headers=
-                headers,
-            params=
-                params,
-            timeout=
-                timeout
-        )
-    )
-
-    if response.status_code != 200:
-
-        raise RuntimeError(
-            f"Kalshi order lookup failed.\n"
-            f"HTTP {response.status_code}\n"
-            f"{response.text}"
+            headers=build_auth_headers(method="GET", url=url),
+            params=params,
+            timeout=timeout,
         )
 
-    data = (
-        response.json()
-    )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Kalshi order lookup failed.\n"
+                f"HTTP {response.status_code}\n{response.text}"
+            )
 
-    return data.get(
-        "orders",
-        []
-    )
+        data = response.json()
+        all_orders.extend(data.get("orders", []))
+
+        next_cursor = data.get("cursor")
+        if not next_cursor:
+            return all_orders
+
+        if next_cursor in seen_cursors:
+            raise RuntimeError(
+                "Kalshi order lookup repeated a pagination cursor."
+            )
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
 
 
 def find_order_by_client_order_id(

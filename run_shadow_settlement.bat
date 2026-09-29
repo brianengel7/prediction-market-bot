@@ -19,3 +19,12 @@ echo ============================================================ >> logs\shadow
 "C:\Users\surfe\Downloads\prediction-market-bot\.venv\Scripts\python.exe" -m src.kalshi.v2_shadow_settler --save >> logs\shadow_settlement.log 2>&1
 
 echo. >> logs\shadow_settlement.log
+
+
+echo ============================================================ >> logs\live_order_settlement.log
+echo LIVE ORDER RECOVERY AND SETTLEMENT >> logs\live_order_settlement.log
+echo ============================================================ >> logs\live_order_settlement.log
+
+"C:\Users\surfe\Downloads\prediction-market-bot\.venv\Scripts\python.exe" -m src.kalshi.live_order_settler --save >> logs\live_order_settlement.log 2>&1
+
+echo. >> logs\live_order_settlement.log

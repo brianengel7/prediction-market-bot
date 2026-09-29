@@ -1,5 +1,6 @@
 import os
 import uuid
+import math
 
 import pandas as pd
 
@@ -467,7 +468,8 @@ def recover_unknown_submission(
     trade,
     strategy,
     contracts,
-    client_order_id
+    client_order_id,
+    save=True
 ):
     """
     Check Kalshi for an order whose POST response
@@ -540,21 +542,36 @@ def recover_unknown_submission(
         )
     )
 
-    fill_count = float(
-        summary[
-            "fill_count"
-        ]
+    reconciled_count = float(summary["fill_count"])
+    reported_count = server_order.get("fill_count_fp")
+    previous_count = trade.get("fill_count")
+
+    try:
+        previous_count = float(previous_count)
+    except (TypeError, ValueError):
+        previous_count = 0.0
+
+    if not math.isfinite(previous_count) or previous_count < 0:
+        previous_count = 0.0
+
+    fill_count = max(
+        reconciled_count,
+        float(reported_count) if reported_count is not None else 0.0,
+        previous_count
     )
 
-    contracts = float(
-        contracts
+    fills_complete = (
+        fill_count > 0
+        and reconciled_count + 1e-9 >= fill_count
     )
 
-    remaining_count = max(
-        contracts
-        -
-        fill_count,
-        0.0
+    contracts = float(contracts)
+
+    server_remaining = server_order.get("remaining_count_fp")
+    remaining_count = (
+        float(server_remaining)
+        if server_remaining is not None
+        else max(contracts - fill_count, 0.0)
     )
 
     if (
@@ -564,13 +581,13 @@ def recover_unknown_submission(
     ):
 
         recovered_status = (
-            "FILLED"
+            "FILLED" if fills_complete else "FILLED_UNRECONCILED"
         )
 
     elif fill_count > 0:
 
         recovered_status = (
-            "PARTIAL"
+            "PARTIAL" if fills_complete else "PARTIAL_UNRECONCILED"
         )
 
     else:
@@ -586,7 +603,7 @@ def recover_unknown_submission(
             .lower()
         )
 
-        if server_status == "canceled":
+        if server_status == "canceled" and reported_count is not None:
 
             recovered_status = (
                 "UNFILLED"
@@ -615,35 +632,35 @@ def recover_unknown_submission(
             remaining_count,
 
         "average_fill_price":
-            summary[
-                "average_fill_price"
-            ],
+            summary["average_fill_price"] if fills_complete else None,
 
         "average_fee_paid":
-            summary[
-                "average_fee_paid"
-            ]
+            summary["average_fee_paid"] if fills_complete else None,
+
+        "order_status":
+            recovered_status
     }
 
-    record_live_order(
-        strategy=
-            strategy,
+    if save:
+        record_live_order(
+            strategy=
+                strategy,
 
-        trade=
-            trade,
+            trade=
+                trade,
 
-        contracts=
-            contracts,
+            contracts=
+                contracts,
 
-        client_order_id=
-            client_order_id,
+            client_order_id=
+                client_order_id,
 
-        order_status=
-            recovered_status,
+            order_status=
+                recovered_status,
 
-        result=
-            recovered_result
-    )
+            result=
+                recovered_result
+        )
 
     print(
         f"Unknown submission recovered "
@@ -696,16 +713,31 @@ def enforce_global_pilot_risk_cap(
             .upper()
         )
 
-        # These states are definitively zero exposure.
-        if status in (
-            "UNFILLED",
-            "ERROR"
+        remaining_count = order.get("remaining_count")
+        pending_remainder = (
+            not pd.isna(remaining_count)
+            and float(remaining_count) > 0
+        )
+
+        # An older UNFILLED row may still have pending contracts.
+        if status == "ERROR" or (
+            status == "UNFILLED" and not pending_remainder
         ):
             continue
 
         fill_count = order.get(
             "fill_count"
         )
+
+        if pending_remainder:
+            existing_contracts = order.get("contracts")
+            reserved_contracts += max(
+                float(fill_count) if not pd.isna(fill_count) else 0.0,
+                float(existing_contracts)
+                if not pd.isna(existing_contracts)
+                else MAX_CONTRACTS,
+            )
+            continue
 
         # Known fills count as actual exposure.
         if (
@@ -911,7 +943,7 @@ def execute_live_trade(
     # --------------------------------------------------------
     # 6. Real API submission
     # --------------------------------------------------------
-
+    result = None
     try:
 
         result = place_order(
@@ -970,7 +1002,7 @@ def execute_live_trade(
 
         else:
 
-            status = "UNFILLED"
+            status = "ACCEPTED_PENDING" if remaining_count > 0 else "UNFILLED"
 
         # ----------------------------------------------------
         # Reconcile actual fills
@@ -1081,7 +1113,7 @@ def execute_live_trade(
         # ----------------------------------------------------
         # Save final execution state
         # ----------------------------------------------------
-
+        result = reconciled_result
         record_live_order(
             strategy=
                 strategy,
@@ -1211,8 +1243,10 @@ def execute_live_trade(
             client_order_id=
                 client_order_id,
 
-            order_status=
-                "ERROR",
+            order_status=(
+                "ERROR" if result is None else "ACCEPTED_UNRECONCILED"
+            ),
+            result=result,
 
             error_message=
                 f"{type(error).__name__}: "
