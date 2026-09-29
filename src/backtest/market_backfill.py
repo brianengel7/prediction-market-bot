@@ -133,34 +133,16 @@ def backfill_market_history(
 
 if __name__ == "__main__":
 
-    decision_times = [
-        (18, 0),
-        (19, 0),
-        (20, 5),
-        (21, 0),
-        (22, 0)
-    ]
+    backfill_market_history(
+        start_date=
+            "2026-09-27",
 
-    for hour, minute in decision_times:
+        end_date=
+            "2026-09-28",
 
-        print()
-        print("#" * 80)
-        print(
-            f"BACKFILLING "
-            f"{hour:02d}:{minute:02d} UTC"
-        )
-        print("#" * 80)
+        decision_hour=
+            20,
 
-        backfill_market_history(
-            start_date=
-                "2026-07-19",
-
-            end_date=
-                "2026-09-10",
-
-            decision_hour=
-                hour,
-
-            decision_minute=
-                minute
-        )
+        decision_minute=
+            5
+    )

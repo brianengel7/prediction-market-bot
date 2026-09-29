@@ -32,7 +32,7 @@ from src.database.db import (
 # ============================================================
 
 START_DATE = "2026-07-19"
-END_DATE = "2026-09-10"
+END_DATE = "2026-09-26"
 
 DECISION_TIME = "20:05"
 

@@ -298,6 +298,114 @@ def initialize_database():
             """
         )
 
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS v2_shadow_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                created_at TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+
+                decision_time TEXT NOT NULL,
+
+                kalshi_probability REAL NOT NULL,
+                nbm_probability REAL NOT NULL,
+                adjusted_probability REAL NOT NULL,
+
+                entry_price REAL NOT NULL,
+                fee REAL NOT NULL,
+                total_cost REAL NOT NULL,
+                net_edge REAL NOT NULL,
+
+                beta REAL NOT NULL,
+                minimum_edge REAL NOT NULL,
+
+                settled INTEGER NOT NULL DEFAULT 0,
+
+                won INTEGER,
+                payout REAL,
+                net_pnl REAL,
+
+                UNIQUE (
+                    target_date
+                )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS v2_nbm_probabilities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                created_at TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+
+                ticker TEXT NOT NULL,
+
+                strike_type TEXT,
+                floor_strike REAL,
+                cap_strike REAL,
+
+                nbm_probability REAL NOT NULL,
+
+                nbm_forecast REAL NOT NULL,
+                residual_std REAL NOT NULL,
+
+                UNIQUE (
+                    target_date,
+                    ticker
+                )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                v2_market_only_shadow_decisions (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                created_at TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+                decision_time TEXT NOT NULL,
+
+                training_start TEXT NOT NULL,
+                training_end TEXT NOT NULL,
+                lookback_days INTEGER NOT NULL,
+
+                alpha REAL NOT NULL,
+                raw_mid_sum REAL NOT NULL,
+
+                trade_taken INTEGER NOT NULL,
+
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+
+                kalshi_probability REAL NOT NULL,
+                adjusted_probability REAL NOT NULL,
+
+                entry_price REAL NOT NULL,
+                fee REAL NOT NULL,
+                total_cost REAL NOT NULL,
+                net_edge REAL NOT NULL,
+
+                minimum_edge REAL NOT NULL,
+
+                settled INTEGER NOT NULL DEFAULT 0,
+                won INTEGER,
+                payout REAL,
+                net_pnl REAL,
+
+                UNIQUE(target_date)
+            )
+            """
+        )
+
 
 def get_cached_temperature(
     model,
@@ -1501,6 +1609,424 @@ def get_historical_market_entries(
         )
 
     return dataframe
+
+def save_v2_nbm_probabilities(
+    target_date,
+    probabilities
+):
+    created_at = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).isoformat()
+    )
+
+    with get_connection() as connection:
+
+        for row in probabilities:
+
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO
+                    v2_nbm_probabilities (
+                        created_at,
+                        target_date,
+                        ticker,
+                        strike_type,
+                        floor_strike,
+                        cap_strike,
+                        nbm_probability,
+                        nbm_forecast,
+                        residual_std
+                    )
+
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    created_at,
+                    str(target_date),
+
+                    row[
+                        "ticker"
+                    ],
+
+                    row.get(
+                        "strike_type"
+                    ),
+
+                    row.get(
+                        "floor_strike"
+                    ),
+
+                    row.get(
+                        "cap_strike"
+                    ),
+
+                    float(
+                        row[
+                            "nbm_probability"
+                        ]
+                    ),
+
+                    float(
+                        row[
+                            "nbm_forecast"
+                        ]
+                    ),
+
+                    float(
+                        row[
+                            "residual_std"
+                        ]
+                    )
+                )
+            )
+
+def get_v2_nbm_probabilities(
+    target_date
+):
+
+    with get_connection() as connection:
+
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM v2_nbm_probabilities
+            WHERE target_date = ?
+            ORDER BY ticker
+            """,
+            connection,
+            params=[
+                str(target_date)
+            ]
+        )
+
+def save_v2_shadow_trade(
+    trade
+):
+
+    created_at = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).isoformat()
+    )
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            INSERT INTO v2_shadow_trades (
+                created_at,
+                target_date,
+                ticker,
+                side,
+                decision_time,
+                kalshi_probability,
+                nbm_probability,
+                adjusted_probability,
+                entry_price,
+                fee,
+                total_cost,
+                net_edge,
+                beta,
+                minimum_edge
+            )
+
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                created_at,
+
+                str(
+                    trade[
+                        "target_date"
+                    ]
+                ),
+
+                trade[
+                    "ticker"
+                ],
+
+                trade[
+                    "side"
+                ],
+
+                str(
+                    trade[
+                        "decision_time"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "kalshi_probability"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "nbm_probability"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "adjusted_probability"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "entry_price"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "fee"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "total_cost"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "net_edge"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "beta"
+                    ]
+                ),
+
+                float(
+                    trade[
+                        "minimum_edge"
+                    ]
+                )
+            )
+        )
+
+def get_v2_shadow_trades():
+
+    with get_connection() as connection:
+
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM v2_shadow_trades
+            ORDER BY target_date
+            """,
+            connection
+        )
+
+def save_v2_market_only_shadow_decision(
+    decision
+):
+
+    created_at = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).isoformat()
+    )
+
+    trade_taken = bool(
+        decision[
+            "trade_taken"
+        ]
+    )
+
+    # PASS days are already complete decisions.
+    settled = (
+        0
+        if trade_taken
+        else 1
+    )
+
+    net_pnl = (
+        None
+        if trade_taken
+        else 0.0
+    )
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            INSERT INTO
+                v2_market_only_shadow_decisions (
+
+                created_at,
+                target_date,
+                decision_time,
+
+                training_start,
+                training_end,
+                lookback_days,
+
+                alpha,
+                raw_mid_sum,
+
+                trade_taken,
+
+                ticker,
+                side,
+
+                kalshi_probability,
+                adjusted_probability,
+
+                entry_price,
+                fee,
+                total_cost,
+                net_edge,
+
+                minimum_edge,
+
+                settled,
+                net_pnl
+            )
+
+            VALUES (
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?,
+                ?, ?,
+                ?, ?,
+                ?, ?, ?, ?,
+                ?,
+                ?, ?
+            )
+            """,
+
+            (
+                created_at,
+
+                str(
+                    decision[
+                        "target_date"
+                    ]
+                ),
+
+                str(
+                    decision[
+                        "decision_time"
+                    ]
+                ),
+
+                str(
+                    decision[
+                        "training_start"
+                    ]
+                ),
+
+                str(
+                    decision[
+                        "training_end"
+                    ]
+                ),
+
+                int(
+                    decision[
+                        "lookback_days"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "alpha"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "raw_mid_sum"
+                    ]
+                ),
+
+                int(
+                    trade_taken
+                ),
+
+                decision[
+                    "ticker"
+                ],
+
+                decision[
+                    "side"
+                ],
+
+                float(
+                    decision[
+                        "kalshi_probability"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "adjusted_probability"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "entry_price"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "fee"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "total_cost"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "net_edge"
+                    ]
+                ),
+
+                float(
+                    decision[
+                        "minimum_edge"
+                    ]
+                ),
+
+                settled,
+                net_pnl
+            )
+        )
+
+
+def get_v2_market_only_shadow_decisions():
+
+    with get_connection() as connection:
+
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM v2_market_only_shadow_decisions
+            ORDER BY target_date
+            """,
+
+            connection
+        )
 
 initialize_database()
 

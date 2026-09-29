@@ -6,7 +6,15 @@ from src.kalshi.markets import parse_markets
 from src.kalshi.events import get_weather_target_date
 from src.weather.hrrr import compare_hrrr_runs, get_recent_hrrr_runs
 from src.weather.gefs import get_latest_gefs_run, get_gefs_ensemble
-from src.database.db import save_model_snapshot, save_market_snapshots, save_weather_fair_values
+from src.database.db import (
+    save_model_snapshot, 
+    save_market_snapshots, 
+    save_weather_fair_values,
+    save_v2_nbm_probabilities
+)
+from src.weather.nbm_signal import (
+    build_live_nbm_probabilities
+)
 from src.weather.observations import get_observed_high
 from src.weather.client import get_nws_high_forecast
 from src.strategy.weather_edge import analyze_weather_markets, PROBABILITY_MODEL_VERSION
@@ -154,6 +162,37 @@ def main():
     gefs_results = bundle[
         "gefs"
     ]
+
+    # ========================================================
+    # WEATHER MODEL V2 - NBM SIGNAL
+    # ========================================================
+
+    nbm_probabilities = (
+        build_live_nbm_probabilities(
+            markets=
+                markets,
+
+            bundle=
+                bundle,
+
+            target_date=
+                target_date
+        )
+    )
+
+    save_v2_nbm_probabilities(
+        target_date=
+            target_date,
+
+        probabilities=
+            nbm_probabilities
+    )
+
+    print(
+        f"Saved "
+        f"{len(nbm_probabilities)} "
+        f"NBM v2 probabilities."
+    )
 
     edge_results = analyze_weather_markets(
         markets=markets,
