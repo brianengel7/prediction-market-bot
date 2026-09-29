@@ -2028,5 +2028,66 @@ def get_v2_market_only_shadow_decisions():
             connection
         )
 
+def update_v2_shadow_trade_settlement(
+    trade_id,
+    won,
+    payout,
+    net_pnl
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            UPDATE v2_shadow_trades
+
+            SET
+                settled = 1,
+                won = ?,
+                payout = ?,
+                net_pnl = ?
+
+            WHERE id = ?
+            """,
+
+            (
+                int(bool(won)),
+                float(payout),
+                float(net_pnl),
+                int(trade_id)
+            )
+        )
+
+
+def update_v2_market_only_shadow_settlement(
+    decision_id,
+    won,
+    payout,
+    net_pnl
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            UPDATE v2_market_only_shadow_decisions
+
+            SET
+                settled = 1,
+                won = ?,
+                payout = ?,
+                net_pnl = ?
+
+            WHERE id = ?
+            """,
+
+            (
+                int(bool(won)),
+                float(payout),
+                float(net_pnl),
+                int(decision_id)
+            )
+        )
+
 initialize_database()
 
