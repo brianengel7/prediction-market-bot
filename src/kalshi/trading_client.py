@@ -724,3 +724,105 @@ def summarize_order_fills(
         "average_fee_paid":
             average_fee_paid
     }
+
+def get_market_settlement(
+    ticker,
+    timeout=15
+):
+    """
+    Retrieve the current settlement state
+    for one Kalshi market.
+    """
+
+    if not ticker:
+
+        raise ValueError(
+            "ticker is required."
+        )
+
+    base_url = os.getenv(
+        "KALSHI_BASE_URL",
+        DEFAULT_BASE_URL
+    )
+
+    url = (
+        base_url
+        +
+        f"/markets/{ticker}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=timeout
+    )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            f"Kalshi market lookup failed.\n"
+            f"HTTP {response.status_code}\n"
+            f"{response.text}"
+        )
+
+    data = response.json()
+
+    market = data.get(
+        "market"
+    )
+
+    if not market:
+
+        raise RuntimeError(
+            f"Kalshi returned no market "
+            f"for {ticker}."
+        )
+
+    result = (
+        market.get(
+            "result"
+        )
+    )
+
+    if result is not None:
+
+        result = (
+            str(result)
+            .strip()
+            .upper()
+        )
+
+    settlement_value = (
+        market.get(
+            "settlement_value_dollars"
+        )
+    )
+
+    if settlement_value not in (
+        None,
+        ""
+    ):
+
+        settlement_value = float(
+            settlement_value
+        )
+
+    return {
+        "ticker":
+            ticker,
+
+        "status":
+            market.get(
+                "status"
+            ),
+
+        "result":
+            result,
+
+        "settlement_value":
+            settlement_value,
+
+        "settlement_time":
+            market.get(
+                "settlement_ts"
+            )
+    }

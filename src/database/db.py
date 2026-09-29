@@ -2303,5 +2303,47 @@ def get_live_orders():
             connection
         )
 
+def update_live_order_settlement(
+    order_id,
+    won,
+    payout,
+    net_pnl
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            UPDATE live_orders
+
+            SET
+                settled = 1,
+                won = ?,
+                payout = ?,
+                net_pnl = ?,
+                order_status = 'SETTLED'
+
+            WHERE id = ?
+            """,
+
+            (
+                int(
+                    bool(won)
+                ),
+
+                float(
+                    payout
+                ),
+
+                float(
+                    net_pnl
+                ),
+
+                int(
+                    order_id
+                )
+            )
+        )
+
 initialize_database()
 
