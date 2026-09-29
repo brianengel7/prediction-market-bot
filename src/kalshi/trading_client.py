@@ -45,6 +45,19 @@ FILLS_PATH = (
     "/portfolio/fills"
 )
 
+ORDERS_PATH = (
+    "/portfolio/orders"
+)
+
+class OrderSubmissionUnknownError(
+    RuntimeError
+):
+    """
+    The order may or may not have reached Kalshi.
+
+    Never assume the order failed.
+    """
+
 
 # ============================================================
 # CREDENTIALS
@@ -456,17 +469,57 @@ def place_order(
         )
     )
 
-    response = (
-        requests.post(
-            url,
-            headers=
-                headers,
-            json=
-                order,
-            timeout=
-                timeout
+    try:
+        response = (
+            requests.post(
+                url,
+                headers=
+                    headers,
+                json=
+                    order,
+                timeout=
+                    timeout
+            )
         )
-    )
+
+    except requests.exceptions.RequestException as error:
+
+        raise OrderSubmissionUnknownError(
+            "Kalshi order submission state "
+            "is UNKNOWN because the HTTP "
+            "request failed after submission "
+            "may have begun.\n"
+            f"{type(error).__name__}: "
+            f"{error}"
+        ) from error
+
+
+    # ------------------------------------------------------------
+    # These responses are ambiguous enough that we do NOT
+    # assume the order failed.
+    # ------------------------------------------------------------
+
+    if (
+        response.status_code
+        in (
+            408,
+            409
+        )
+        or
+        response.status_code >= 500
+    ):
+
+        raise OrderSubmissionUnknownError(
+            "Kalshi order submission state "
+            "is UNKNOWN.\n"
+            f"HTTP {response.status_code}\n"
+            f"{response.text}"
+        )
+
+
+    # ------------------------------------------------------------
+    # Normal definitive rejection
+    # ------------------------------------------------------------
 
     if response.status_code != 201:
 
@@ -533,6 +586,132 @@ def place_order(
                 "average_fee_paid"
             )
     }
+
+def get_orders(
+    ticker=None,
+    status=None,
+    limit=1000,
+    timeout=15
+):
+    """
+    Retrieve authenticated Kalshi orders.
+    """
+
+    base_url = os.getenv(
+        "KALSHI_BASE_URL",
+        DEFAULT_BASE_URL
+    )
+
+    url = (
+        base_url
+        +
+        ORDERS_PATH
+    )
+
+    params = {
+        "limit":
+            limit
+    }
+
+    if ticker:
+
+        params[
+            "ticker"
+        ] = ticker
+
+    if status:
+
+        params[
+            "status"
+        ] = status
+
+    headers = (
+        build_auth_headers(
+            method="GET",
+            url=url
+        )
+    )
+
+    response = (
+        requests.get(
+            url,
+            headers=
+                headers,
+            params=
+                params,
+            timeout=
+                timeout
+        )
+    )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            f"Kalshi order lookup failed.\n"
+            f"HTTP {response.status_code}\n"
+            f"{response.text}"
+        )
+
+    data = (
+        response.json()
+    )
+
+    return data.get(
+        "orders",
+        []
+    )
+
+
+def find_order_by_client_order_id(
+    client_order_id,
+    ticker=None
+):
+    """
+    Search recent Kalshi orders for our
+    deterministic client_order_id.
+    """
+
+    if not client_order_id:
+
+        raise ValueError(
+            "client_order_id is required."
+        )
+
+    statuses = (
+        "resting",
+        "executed",
+        "canceled"
+    )
+
+    for status in statuses:
+
+        orders = (
+            get_orders(
+                ticker=
+                    ticker,
+
+                status=
+                    status
+            )
+        )
+
+        for order in orders:
+
+            if (
+                str(
+                    order.get(
+                        "client_order_id"
+                    )
+                )
+                ==
+                str(
+                    client_order_id
+                )
+            ):
+
+                return order
+
+    return None
 
 def get_order_fills(
     order_id,

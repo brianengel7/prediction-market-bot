@@ -33,6 +33,10 @@ from src.kalshi.live_executor import (
     execute_live_trade
 )
 
+from src.kalshi.decision_timing import (
+    validate_decision_quote_time
+)
+
 
 # ============================================================
 # FROZEN FORWARD STRATEGY
@@ -787,30 +791,22 @@ def run_shadow_trader(
             "without saving the shadow decision."
         )
 
-    event_info = (
+    # --------------------------------------------------------
+    # 1. Discover target date
+    # --------------------------------------------------------
+
+    discovery_event = (
         get_current_weather_event()
     )
 
     target_date = (
-        event_info[
+        discovery_event[
             "target_date"
         ]
     )
 
-    markets = (
-        event_info[
-            "markets"
-        ]
-    )
-
-    decision_time = (
-        pd.Timestamp.now(
-            tz="UTC"
-        )
-    )
-
     # --------------------------------------------------------
-    # Fit alpha using historical outcomes only.
+    # 2. Fit alpha BEFORE fetching decision quotes
     # --------------------------------------------------------
 
     calibration = (
@@ -826,7 +822,55 @@ def run_shadow_trader(
     )
 
     # --------------------------------------------------------
-    # Build current Kalshi distribution.
+    # 3. Fetch FRESH Kalshi quotes
+    # --------------------------------------------------------
+
+    event_info = (
+        get_current_weather_event()
+    )
+
+    if (
+        event_info[
+            "target_date"
+        ]
+        !=
+        target_date
+    ):
+
+        raise RuntimeError(
+            "Target date changed between "
+            "event discovery and decision quote fetch.\n"
+            f"Original target: {target_date}\n"
+            f"Current target: "
+            f"{event_info['target_date']}"
+        )
+
+    markets = (
+        event_info[
+            "markets"
+        ]
+    )
+
+    quote_time = (
+        event_info[
+            "quote_time"
+        ]
+    )
+
+    if save:
+
+        quote_time = (
+            validate_decision_quote_time(
+                quote_time
+            )
+        )
+
+    decision_time = (
+        quote_time
+    )
+
+    # --------------------------------------------------------
+    # 4. Build distribution from those exact quotes
     # --------------------------------------------------------
 
     (

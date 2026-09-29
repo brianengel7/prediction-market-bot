@@ -2303,6 +2303,51 @@ def get_live_orders():
             connection
         )
 
+def update_live_order_reconciliation(
+    order_id,
+    fill_count,
+    average_fill_price,
+    average_fee_paid,
+    order_status
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            """
+            UPDATE live_orders
+
+            SET
+                fill_count = ?,
+                average_fill_price = ?,
+                average_fee_paid = ?,
+                order_status = ?,
+                error_message = NULL
+
+            WHERE id = ?
+            """,
+
+            (
+                float(
+                    fill_count
+                ),
+
+                float(
+                    average_fill_price
+                ),
+
+                float(
+                    average_fee_paid
+                ),
+
+                order_status,
+
+                int(
+                    order_id
+                )
+            )
+        )
+
 def update_live_order_settlement(
     order_id,
     won,

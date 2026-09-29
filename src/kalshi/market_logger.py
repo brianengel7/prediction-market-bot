@@ -50,6 +50,11 @@ def get_current_weather_event():
         series_ticker=SERIES_TICKER,
         status="open"
     )
+    quote_time = (
+        pd.Timestamp.now(
+            tz="UTC"
+        )
+    )
 
     markets = parse_markets(
         markets_data
@@ -149,7 +154,10 @@ def get_current_weather_event():
             target_date,
 
         "markets":
-            event_markets
+            event_markets,
+
+        "quote_time":
+            quote_time
     }
 
 

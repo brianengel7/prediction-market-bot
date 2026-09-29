@@ -3,20 +3,23 @@ import uuid
 
 import pandas as pd
 
-from src.kalshi.trading_client import (
-    place_order,
-    get_order_fills,
-    summarize_order_fills
-)
-
 from src.database.db import (
     get_live_orders,
     save_live_order
 )
 
+from src.kalshi.trading_client import (
+    place_order,
+    get_order_fills,
+    summarize_order_fills,
+    find_order_by_client_order_id,
+    OrderSubmissionUnknownError
+)
+
 
 MINIMUM_NET_EDGE = 0.025
 MAX_CONTRACTS = 1
+MAX_LIVE_CONTRACTS_PER_TARGET_DATE = 1
 MAX_DECISION_AGE_MINUTES = 15
 
 
@@ -85,7 +88,19 @@ def ensure_not_already_submitted(
 
     if not duplicate.empty:
 
-        existing = duplicate.iloc[-1]
+        existing = (
+            duplicate.iloc[-1]
+        )
+
+        existing_status = (
+            str(
+                existing[
+                    "order_status"
+                ]
+            )
+            .strip()
+            .upper()
+        )
 
         raise RuntimeError(
             "LIVE ORDER BLOCKED: "
@@ -94,7 +109,10 @@ def ensure_not_already_submitted(
             f"Client order ID: "
             f"{client_order_id}\n"
             f"Existing status: "
-            f"{existing['order_status']}"
+            f"{existing_status}\n"
+            "The existing order must be "
+            "resolved before another "
+            "submission is permitted."
         )
 
 def record_live_order(
@@ -445,6 +463,310 @@ def reconcile_order(
             fills
     }
 
+def recover_unknown_submission(
+    trade,
+    strategy,
+    contracts,
+    client_order_id
+):
+    """
+    Check Kalshi for an order whose POST response
+    was lost or otherwise ambiguous.
+
+    This function NEVER submits another order.
+    """
+
+    print()
+    print(
+        "CHECKING KALSHI FOR "
+        "UNKNOWN SUBMISSION..."
+    )
+
+    server_order = (
+        find_order_by_client_order_id(
+            client_order_id=
+                client_order_id,
+
+            ticker=
+                trade[
+                    "ticker"
+                ]
+        )
+    )
+
+    if server_order is None:
+
+        print(
+            "No matching Kalshi order "
+            "found yet."
+        )
+
+        return None
+
+    kalshi_order_id = (
+        server_order.get(
+            "order_id"
+        )
+    )
+
+    if not kalshi_order_id:
+
+        raise RuntimeError(
+            "Recovered Kalshi order is "
+            "missing order_id."
+        )
+
+    print(
+        f"Recovered Kalshi order: "
+        f"{kalshi_order_id}"
+    )
+
+    fills = (
+        get_order_fills(
+            order_id=
+                kalshi_order_id
+        )
+    )
+
+    summary = (
+        summarize_order_fills(
+            fills=
+                fills,
+
+            outcome_side=
+                trade[
+                    "side"
+                ]
+        )
+    )
+
+    fill_count = float(
+        summary[
+            "fill_count"
+        ]
+    )
+
+    contracts = float(
+        contracts
+    )
+
+    remaining_count = max(
+        contracts
+        -
+        fill_count,
+        0.0
+    )
+
+    if (
+        fill_count
+        >=
+        contracts
+    ):
+
+        recovered_status = (
+            "FILLED"
+        )
+
+    elif fill_count > 0:
+
+        recovered_status = (
+            "PARTIAL"
+        )
+
+    else:
+
+        server_status = (
+            str(
+                server_order.get(
+                    "status",
+                    ""
+                )
+            )
+            .strip()
+            .lower()
+        )
+
+        if server_status == "canceled":
+
+            recovered_status = (
+                "UNFILLED"
+            )
+
+        else:
+
+            recovered_status = (
+                "RECOVERED_"
+                +
+                server_status.upper()
+            )
+
+    recovered_result = {
+
+        "order_id":
+            kalshi_order_id,
+
+        "client_order_id":
+            client_order_id,
+
+        "fill_count":
+            fill_count,
+
+        "remaining_count":
+            remaining_count,
+
+        "average_fill_price":
+            summary[
+                "average_fill_price"
+            ],
+
+        "average_fee_paid":
+            summary[
+                "average_fee_paid"
+            ]
+    }
+
+    record_live_order(
+        strategy=
+            strategy,
+
+        trade=
+            trade,
+
+        contracts=
+            contracts,
+
+        client_order_id=
+            client_order_id,
+
+        order_status=
+            recovered_status,
+
+        result=
+            recovered_result
+    )
+
+    print(
+        f"Unknown submission recovered "
+        f"as {recovered_status}."
+    )
+
+    return recovered_result
+
+def enforce_global_pilot_risk_cap(
+    target_date,
+    requested_contracts
+):
+    """
+    Prevent total live exposure for one target date
+    from exceeding the pilot risk limit.
+
+    Definitively UNFILLED or ERROR orders consume
+    no exposure.
+
+    Ambiguous/in-flight orders reserve their full
+    requested contract count.
+    """
+
+    orders = get_live_orders()
+
+    if orders.empty:
+        return
+
+    same_date = orders[
+        orders["target_date"].astype(str)
+        ==
+        str(target_date)
+    ]
+
+    if same_date.empty:
+        return
+
+    reserved_contracts = 0.0
+
+    for _, order in same_date.iterrows():
+
+        status = (
+            str(
+                order.get(
+                    "order_status",
+                    ""
+                )
+            )
+            .strip()
+            .upper()
+        )
+
+        # These states are definitively zero exposure.
+        if status in (
+            "UNFILLED",
+            "ERROR"
+        ):
+            continue
+
+        fill_count = order.get(
+            "fill_count"
+        )
+
+        # Known fills count as actual exposure.
+        if (
+            not pd.isna(
+                fill_count
+            )
+            and
+            float(fill_count) > 0
+        ):
+
+            reserved_contracts += float(
+                fill_count
+            )
+
+            continue
+
+        # Anything else may still represent exposure:
+        # SUBMITTING, SUBMISSION_UNKNOWN,
+        # unreconciled orders, recovered orders, etc.
+        existing_contracts = order.get(
+            "contracts"
+        )
+
+        if pd.isna(
+            existing_contracts
+        ):
+
+            existing_contracts = (
+                MAX_CONTRACTS
+            )
+
+        reserved_contracts += float(
+            existing_contracts
+        )
+
+    projected_contracts = (
+        reserved_contracts
+        +
+        float(
+            requested_contracts
+        )
+    )
+
+    if (
+        projected_contracts
+        >
+        MAX_LIVE_CONTRACTS_PER_TARGET_DATE
+    ):
+
+        raise RuntimeError(
+            "LIVE TRADE BLOCKED BY GLOBAL "
+            "PILOT RISK CAP.\n"
+            f"Target date: {target_date}\n"
+            f"Existing/reserved contracts: "
+            f"{reserved_contracts:g}\n"
+            f"Requested contracts: "
+            f"{float(requested_contracts):g}\n"
+            f"Maximum allowed: "
+            f"{MAX_LIVE_CONTRACTS_PER_TARGET_DATE}"
+        )
+
 
 def execute_live_trade(
     trade,
@@ -505,6 +827,18 @@ def execute_live_trade(
 
     ensure_not_already_submitted(
         client_order_id
+    )
+
+    enforce_global_pilot_risk_cap(
+        target_date=
+            validated[
+                "target_date"
+            ],
+
+        requested_contracts=
+            validated[
+                "contracts"
+            ]
     )
 
     print()
@@ -798,6 +1132,70 @@ def execute_live_trade(
         return (
             reconciled_result
         )
+
+    except OrderSubmissionUnknownError as error:
+
+        record_live_order(
+            strategy=
+                strategy,
+
+            trade=
+                trade,
+
+            contracts=
+                contracts,
+
+            client_order_id=
+                client_order_id,
+
+            order_status=
+                "SUBMISSION_UNKNOWN",
+
+            error_message=
+                f"{type(error).__name__}: "
+                f"{error}"
+        )
+
+        print()
+        print("=" * 72)
+        print(
+            "ORDER SUBMISSION STATE UNKNOWN"
+        )
+        print("=" * 72)
+
+        print(
+            "The bot will NOT assume "
+            "the order failed."
+        )
+
+        recovered = (
+            recover_unknown_submission(
+                trade=
+                    trade,
+
+                strategy=
+                    strategy,
+
+                contracts=
+                    contracts,
+
+                client_order_id=
+                    client_order_id
+            )
+        )
+
+        if recovered is None:
+
+            raise RuntimeError(
+                "Live order remains "
+                "SUBMISSION_UNKNOWN. "
+                "Do NOT submit another order "
+                "for this decision until "
+                "reconciliation succeeds."
+            ) from error
+
+        return recovered
+        
     except Exception as error:
 
         record_live_order(

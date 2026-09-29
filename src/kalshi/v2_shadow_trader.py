@@ -19,6 +19,9 @@ from src.kalshi.fees import (
 from src.kalshi.live_executor import (
     execute_live_trade
 )
+from src.kalshi.decision_timing import (
+    validate_decision_quote_time
+)
 
 
 # ============================================================
@@ -545,21 +548,24 @@ def run_shadow_trader(
             "without saving the shadow decision."
         )
 
-    event_info = (
+    # --------------------------------------------------------
+    # 1. Discover target date
+    # --------------------------------------------------------
+
+    discovery_event = (
         get_current_weather_event()
     )
 
     target_date = (
-        event_info[
+        discovery_event[
             "target_date"
         ]
     )
 
-    markets = (
-        event_info[
-            "markets"
-        ]
-    )
+    # --------------------------------------------------------
+    # 2. Load today's already-computed NBM probabilities
+    # BEFORE fetching the quotes used for the decision.
+    # --------------------------------------------------------
 
     nbm_data = (
         get_v2_nbm_probabilities(
@@ -578,6 +584,62 @@ def run_shadow_trader(
             f"Run main.py first."
         )
 
+    # --------------------------------------------------------
+    # 3. Fetch FRESH Kalshi quotes for the actual decision
+    # --------------------------------------------------------
+
+    event_info = (
+        get_current_weather_event()
+    )
+
+    if (
+        event_info[
+            "target_date"
+        ]
+        !=
+        target_date
+    ):
+
+        raise RuntimeError(
+            "Target date changed between "
+            "event discovery and decision quote fetch.\n"
+            f"Original target: {target_date}\n"
+            f"Current target: "
+            f"{event_info['target_date']}"
+        )
+
+    markets = (
+        event_info[
+            "markets"
+        ]
+    )
+
+    quote_time = (
+        event_info[
+            "quote_time"
+        ]
+    )
+
+    # Saved/live decisions must use quotes captured
+    # during the frozen 20:05 UTC decision window.
+    if save:
+
+        quote_time = (
+            validate_decision_quote_time(
+                quote_time
+            )
+        )
+
+    # The decision timestamp is now the actual
+    # Kalshi quote timestamp.
+    decision_time = (
+        quote_time
+    )
+
+    # --------------------------------------------------------
+    # 4. Calculate decision from those exact quotes
+    # --------------------------------------------------------
+
     candidates = (
         build_trade_candidates(
             markets=
@@ -588,14 +650,10 @@ def run_shadow_trader(
         )
     )
 
-    best = candidates[
-        0
-    ]
-
-    decision_time = (
-        pd.Timestamp.now(
-            tz="UTC"
-        )
+    best = (
+        candidates[
+            0
+        ]
     )
 
     print()
