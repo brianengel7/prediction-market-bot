@@ -1,28 +1,23 @@
-import sqlite3
+import pandas as pd
 
 from src.database.db import (
-    DATABASE_PATH,
+    get_connection,
+    read_dataframe,
     save_weather_actual,
     save_weather_model_backtest
 )
 
 
 def migrate():
-    with sqlite3.connect(
-        DATABASE_PATH
-    ) as connection:
-
-        connection.row_factory = (
-            sqlite3.Row
-        )
-
-        rows = connection.execute(
+    with get_connection() as connection:
+        rows = read_dataframe(
             """
             SELECT *
             FROM weather_backtests
             ORDER BY target_date
-            """
-        ).fetchall()
+            """,
+            connection,
+        ).to_dict("records")
 
     actual_count = 0
     hrrr_count = 0
@@ -49,7 +44,7 @@ def migrate():
 
         actual_count += 1
 
-        if row["hrrr_high"] is not None:
+        if pd.notna(row["hrrr_high"]):
 
             save_weather_model_backtest(
                 target_date=target_date,
@@ -75,7 +70,7 @@ def migrate():
 
             hrrr_count += 1
 
-        if row["gefs_mean"] is not None:
+        if pd.notna(row["gefs_mean"]):
 
             save_weather_model_backtest(
                 target_date=target_date,

@@ -1,10 +1,9 @@
-import sqlite3
-
 import numpy as np
 import pandas as pd
 
 from src.database.db import (
-    DATABASE_PATH
+    get_connection,
+    read_dataframe
 )
 
 
@@ -33,9 +32,7 @@ def load_historical_data(
     This prevents look-ahead bias.
     """
 
-    with sqlite3.connect(
-        DATABASE_PATH
-    ) as connection:
+    with get_connection() as connection:
 
         query = """
             SELECT
@@ -77,7 +74,7 @@ def load_historical_data(
                 source
         """
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=params

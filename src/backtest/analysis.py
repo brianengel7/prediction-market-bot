@@ -1,20 +1,16 @@
-import sqlite3
-
 import numpy as np
 import pandas as pd
 
 from src.database.db import (
-    DATABASE_PATH
+    get_connection,
+    read_dataframe
 )
-
 
 def load_backtest_data(
     forecast_horizon="D-1_12Z",
     station="KNYC"
 ):
-    with sqlite3.connect(
-        DATABASE_PATH
-    ) as connection:
+    with get_connection() as connection:
 
         query = """
             SELECT
@@ -38,7 +34,7 @@ def load_backtest_data(
             ORDER BY target_date, source
         """
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=(

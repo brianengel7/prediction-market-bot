@@ -1,10 +1,10 @@
-import sqlite3
 
 import numpy as np
 import pandas as pd
 
 from src.database.db import (
-    DATABASE_PATH
+    get_connection,
+    read_dataframe
 )
 
 
@@ -19,9 +19,7 @@ MIN_TRAIN_DAYS = 30
 
 def load_data():
 
-    with sqlite3.connect(
-        DATABASE_PATH
-    ) as connection:
+    with get_connection() as connection:
 
         query = """
             SELECT
@@ -42,7 +40,7 @@ def load_data():
                 source
         """
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=(

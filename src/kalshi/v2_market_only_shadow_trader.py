@@ -34,6 +34,7 @@ from src.kalshi.live_executor import (
 )
 
 from src.kalshi.decision_timing import (
+    MAX_QUOTE_DELAY_MINUTES,
     validate_decision_quote_time
 )
 
@@ -76,20 +77,13 @@ def load_market_only_calibration_history():
     # --------------------------------------------------------
 
     history = history[
-        (
-            history[
-                "decision_time"
-            ].dt.hour
-            ==
-            DECISION_HOUR_UTC
-        )
-        &
-        (
-            history[
-                "decision_time"
-            ].dt.minute
-            ==
-            DECISION_MINUTE_UTC
+        (history["decision_time"].dt.hour == DECISION_HOUR_UTC)
+        & (history["decision_time"].dt.minute == DECISION_MINUTE_UTC)
+        & (history["entry_time"] >= history["decision_time"])
+        & (
+            history["entry_time"]
+            <= history["decision_time"]
+            + pd.Timedelta(minutes=MAX_QUOTE_DELAY_MINUTES)
         )
     ].copy()
 
@@ -308,10 +302,16 @@ def load_market_only_calibration_history():
     )
 
     if dataframe.empty:
-
         raise RuntimeError(
             "No complete settled calibration dates "
             "could be constructed."
+        )
+
+    complete_dates = dataframe["target_date"].nunique()
+    if complete_dates < LOOKBACK_DAYS:
+        raise RuntimeError(
+            f"Only {complete_dates} complete 20:05–20:07 UTC "
+            f"calibration dates; {LOOKBACK_DAYS} are required."
         )
 
     return dataframe

@@ -1,12 +1,10 @@
-import sqlite3
-
 import numpy as np
 import pandas as pd
 
 from src.database.db import (
-    DATABASE_PATH
+    get_connection,
+    read_dataframe
 )
-
 
 START_DATE = "2026-06-13"
 SPLIT_DATE = "2026-08-12"
@@ -18,9 +16,7 @@ STATION = "KNYC"
 
 def load_calibration_data():
 
-    with sqlite3.connect(
-        DATABASE_PATH
-    ) as connection:
+    with get_connection() as connection:
 
         query = """
             SELECT
@@ -41,7 +37,7 @@ def load_calibration_data():
                 source
         """
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=(

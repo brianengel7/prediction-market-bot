@@ -1,13 +1,51 @@
+import os
 import sqlite3
 from pathlib import Path
+
 import pandas as pd
 
 
 DATABASE_PATH = Path(__file__).parent / "prediction_market.db"
 
 
+class PostgresConnection:
+    def __init__(self, url):
+        import psycopg
+
+        self.raw = psycopg.connect(
+            url,
+            sslmode="require",
+            connect_timeout=10,
+            prepare_threshold=None,
+        )
+        self.raw.execute("SET search_path TO prediction_bot, public")
+
+    def __enter__(self):
+        self.raw.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.raw.__exit__(*args)
+
+    def execute(self, query, params=None):
+        return self.raw.execute(
+            query.replace("?", "%s"),
+            params or (),
+        )
+
+
 def get_connection():
+    url = os.environ.get("PREDICTION_DATABASE_URL")
+    if url:
+        return PostgresConnection(url)
     return sqlite3.connect(DATABASE_PATH)
+
+def read_dataframe(query, connection, params=None):
+    cursor = connection.execute(query, params or ())
+    return pd.DataFrame.from_records(
+        cursor.fetchall(),
+        columns=[column[0] for column in cursor.description],
+    )
 
 
 def initialize_database():
@@ -559,7 +597,7 @@ def save_temperature(
 
         connection.execute(
             """
-            INSERT OR REPLACE INTO weather_forecasts (
+            INSERT INTO weather_forecasts (
                 model,
                 product,
                 member,
@@ -571,6 +609,12 @@ def save_temperature(
                 temperature_f
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                model, product, member, run_time,
+                forecast_hour, latitude, longitude
+            ) DO UPDATE SET
+                valid_time = excluded.valid_time,
+                temperature_f = excluded.temperature_f
             """,
             (
                 model,
@@ -823,7 +867,7 @@ def save_weather_backtest(
 
         connection.execute(
             """
-            INSERT OR REPLACE INTO weather_backtests (
+            INSERT INTO weather_backtests (
                 target_date,
                 forecast_horizon,
 
@@ -846,6 +890,17 @@ def save_weather_backtest(
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?
             )
+            ON CONFLICT (target_date, forecast_horizon) DO UPDATE SET
+                actual_high = excluded.actual_high,
+                hrrr_run_time = excluded.hrrr_run_time,
+                hrrr_high = excluded.hrrr_high,
+                hrrr_error = excluded.hrrr_error,
+                gefs_run_time = excluded.gefs_run_time,
+                gefs_mean = excluded.gefs_mean,
+                gefs_median = excluded.gefs_median,
+                gefs_std = excluded.gefs_std,
+                gefs_error = excluded.gefs_error,
+                created_at = excluded.created_at
             """,
             (
                 str(target_date),
@@ -1240,7 +1295,7 @@ def get_weather_fair_values(
           AND model_version = ?
         """
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=(
@@ -1328,7 +1383,7 @@ def get_market_snapshots(
             ticker ASC
         """
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=params
@@ -1626,7 +1681,7 @@ def get_historical_market_entries(
 
     with get_connection() as connection:
 
-        dataframe = pd.read_sql_query(
+        dataframe = read_dataframe(
             query,
             connection,
             params=params
@@ -1670,7 +1725,7 @@ def save_v2_nbm_probabilities(
 
             connection.execute(
                 """
-                INSERT OR REPLACE INTO
+                INSERT INTO
                     v2_nbm_probabilities (
                         created_at,
                         target_date,
@@ -1686,6 +1741,14 @@ def save_v2_nbm_probabilities(
                 VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
+                ON CONFLICT (target_date, ticker) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    strike_type = excluded.strike_type,
+                    floor_strike = excluded.floor_strike,
+                    cap_strike = excluded.cap_strike,
+                    nbm_probability = excluded.nbm_probability,
+                    nbm_forecast = excluded.nbm_forecast,
+                    residual_std = excluded.residual_std
                 """,
                 (
                     created_at,
@@ -1733,7 +1796,7 @@ def get_v2_nbm_probabilities(
 
     with get_connection() as connection:
 
-        return pd.read_sql_query(
+        return read_dataframe(
             """
             SELECT *
             FROM v2_nbm_probabilities
@@ -1865,7 +1928,7 @@ def get_v2_shadow_trades():
 
     with get_connection() as connection:
 
-        return pd.read_sql_query(
+        return read_dataframe(
             """
             SELECT *
             FROM v2_shadow_trades
@@ -2062,7 +2125,7 @@ def get_v2_market_only_shadow_decisions():
 
     with get_connection() as connection:
 
-        return pd.read_sql_query(
+        return read_dataframe(
             """
             SELECT *
             FROM v2_market_only_shadow_decisions
@@ -2294,7 +2357,7 @@ def get_live_orders():
 
     with get_connection() as connection:
 
-        return pd.read_sql_query(
+        return read_dataframe(
             """
             SELECT *
             FROM live_orders
@@ -2390,5 +2453,6 @@ def update_live_order_settlement(
             )
         )
 
-initialize_database()
+if not os.environ.get("PREDICTION_DATABASE_URL"):
+    initialize_database()
 
