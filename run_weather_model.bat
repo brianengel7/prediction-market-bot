@@ -1,5 +1,5 @@
 @echo off
-
+set PYTHONUTF8=1
 cd /d C:\Users\surfe\Downloads\prediction-market-bot
 
 if not exist logs mkdir logs
