@@ -8,6 +8,9 @@ from src.database.db import (
     get_live_orders,
     save_live_order
 )
+from decimal import Decimal, ROUND_CEILING
+
+from src.kalshi.client import get_event, get_series
 
 from src.kalshi.trading_client import (
     place_order,
@@ -800,6 +803,71 @@ def enforce_global_pilot_risk_cap(
         )
 
 
+def enforce_trade_budget(validated):
+    budget = Decimal(
+        os.getenv("KALSHI_MAX_TRADE_DOLLARS", "1.00")
+    )
+    if not budget.is_finite() or budget <= 0:
+        raise RuntimeError(
+            "KALSHI_MAX_TRADE_DOLLARS must be positive and finite."
+        )
+
+    if Decimal(str(validated["contracts"])) != Decimal("1"):
+        raise RuntimeError(
+            "This dollar-cap check supports the one-contract pilot."
+        )
+
+    series_ticker, event_date, _ = str(
+        validated["ticker"]
+    ).split("-", 2)
+
+    series_info = get_series(series_ticker)
+    event_info = get_event(f"{series_ticker}-{event_date}")
+
+    fee_type = (
+        event_info.get("fee_type_override")
+        or series_info.get("fee_type")
+    )
+    override = event_info.get("fee_multiplier_override")
+    multiplier = Decimal(str(
+        override
+        if override is not None
+        else series_info.get("fee_multiplier")
+    ))
+
+    if (
+        fee_type != "quadratic"
+        or not multiplier.is_finite()
+        or not Decimal("0") <= multiplier <= Decimal("1")
+    ):
+        raise RuntimeError(
+            "Live trade blocked: fee schedule needs review."
+        )
+
+    price_limit = Decimal(
+        str(validated["entry_price"])
+    ).quantize(
+        Decimal("0.0001"), rounding=ROUND_CEILING
+    )
+
+    # Conservative allowance for fees and rounding.
+    reserved_cost = (
+        price_limit + Decimal("0.03")
+    ).quantize(
+        Decimal("0.01"), rounding=ROUND_CEILING
+    )
+
+    if reserved_cost > budget:
+        raise RuntimeError(
+            f"Live trade blocked: reserved cost ${reserved_cost:.2f} "
+            f"exceeds trade cap ${budget:.2f}."
+        )
+
+    print(
+        f"Trade cap: ${budget:.2f}; "
+        f"reserved cost: ${reserved_cost:.2f}"
+    )
+
 def execute_live_trade(
     trade,
     strategy,
@@ -833,6 +901,7 @@ def execute_live_trade(
         trade=trade,
         contracts=contracts
     )
+    enforce_trade_budget(validated)
 
     # --------------------------------------------------------
     # 3. Deterministic order ID
