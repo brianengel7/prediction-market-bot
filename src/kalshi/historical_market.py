@@ -186,291 +186,121 @@ def parse_price(
 # PARSE CANDLE
 # ============================================================
 
-def parse_candle(
-    candle
-):
+def parse_candle(candle):
+    def read_close(prices):
+        value = prices.get("close_dollars")
+        if value in (None, ""):
+            value = prices.get("close")
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    "Unexpected numeric close; verify its price units."
+                )
 
-    yes_bid_data = (
-        candle.get(
-            "yes_bid"
-        )
-        or {}
-    )
+        price = parse_price(value)
+        if price is not None and not 0.0 <= price <= 1.0:
+            raise ValueError(f"Invalid dollar quote: {value!r}")
+        return price
 
-    yes_ask_data = (
-        candle.get(
-            "yes_ask"
-        )
-        or {}
-    )
-
-    yes_bid = parse_price(
-        yes_bid_data.get(
-            "close_dollars"
-        )
-    )
-
-    yes_ask = parse_price(
-        yes_ask_data.get(
-            "close_dollars"
-        )
-    )
-
-    # --------------------------------------------------------
-    # Binary contract relationships:
-    #
-    # NO ask = 1 - YES bid
-    # NO bid = 1 - YES ask
-    # --------------------------------------------------------
-
-    no_ask = (
-        1.0 - yes_bid
-        if yes_bid is not None
-        else None
-    )
-
-    no_bid = (
-        1.0 - yes_ask
-        if yes_ask is not None
-        else None
-    )
-
-    timestamp = pd.Timestamp(
-        candle[
-            "end_period_ts"
-        ],
-        unit="s",
-        tz="UTC"
-    )
+    yes_bid = read_close(candle.get("yes_bid") or {})
+    yes_ask = read_close(candle.get("yes_ask") or {})
 
     return {
-
-        "timestamp":
-            timestamp,
-
-        "yes_bid":
-            yes_bid,
-
-        "yes_ask":
-            yes_ask,
-
-        "no_bid":
-            no_bid,
-
-        "no_ask":
-            no_ask
+        "timestamp": pd.Timestamp(
+            candle["end_period_ts"], unit="s", tz="UTC"
+        ),
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "no_bid": 1.0 - yes_ask if yes_ask is not None else None,
+        "no_ask": 1.0 - yes_bid if yes_bid is not None else None,
     }
 
 
-# ============================================================
-# LOAD CANDLES
-# ============================================================
+def load_market_candles(ticker, start_time, end_time):
+    start_ts = int(start_time.timestamp())
+    end_ts = int(end_time.timestamp())
 
-def load_market_candles(
-    ticker,
-    start_time,
-    end_time
-):
-
-    start_ts = int(
-        start_time.timestamp()
+    endpoints = (
+        ("LIVE", get_market_candlesticks, {"series_ticker": SERIES_TICKER}),
+        ("HISTORICAL", get_historical_market_candlesticks, {}),
     )
 
-    end_ts = int(
-        end_time.timestamp()
-    )
-
-    candles = []
-
-    source = None
-
-    # --------------------------------------------------------
-    # Try normal candlestick endpoint first.
-    # --------------------------------------------------------
-
-    try:
-
-        candles = (
-            get_market_candlesticks(
-                series_ticker=
-                    SERIES_TICKER,
-
-                ticker=
-                    ticker,
-
-                start_ts=
-                    start_ts,
-
-                end_ts=
-                    end_ts,
-
-                period_interval=
-                    1
+    for source, fetch, extra in endpoints:
+        try:
+            candles = fetch(
+                ticker=ticker,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                period_interval=1,
+                **extra,
             )
-        )
+        except requests.HTTPError as error:
+            if (
+                error.response is None
+                or error.response.status_code not in (404, 410)
+            ):
+                raise
+            continue
 
         if candles:
+            return {
+                "source": source,
+                "candles": sorted(
+                    candles,
+                    key=lambda candle: candle["end_period_ts"],
+                ),
+            }
 
-            source = "LIVE"
-
-    except requests.HTTPError as error:
-
-        if (
-            error.response is None
-            or
-            error.response.status_code
-            not in (
-                404,
-                410
-            )
-        ):
-
-            raise
-
-    # --------------------------------------------------------
-    # Fall back to historical storage.
-    # --------------------------------------------------------
-
-    if not candles:
-
-        candles = (
-            get_historical_market_candlesticks(
-                ticker=
-                    ticker,
-
-                start_ts=
-                    start_ts,
-
-                end_ts=
-                    end_ts,
-
-                period_interval=
-                    1
-            )
-        )
-
-        if candles:
-
-            source = (
-                "HISTORICAL"
-            )
-
-    return {
-        "source":
-            source,
-
-        "candles":
-            candles
-    }
-
+    return {"source": None, "candles": []}
 
 # ============================================================
 # FIND EXECUTABLE ENTRY QUOTE
 # ============================================================
 
 def get_market_entry_quote(
-    ticker,
-    target_date,
-    decision_hour=20,
-    decision_minute=5
+    ticker, target_date, decision_hour=20, decision_minute=5,
+    calibration_quotes=False,
 ):
-
-    decision_time = (
-        get_decision_time(
-            target_date,
-            decision_hour=
-                decision_hour,
-            decision_minute=
-                decision_minute
-        )
+    decision = get_decision_time(
+        target_date, decision_hour=decision_hour,
+        decision_minute=decision_minute,
     )
+    if calibration_quotes:
+        start = decision - pd.Timedelta(minutes=30)
+        end = decision
+    else:
+        start = decision
+        end = decision + pd.Timedelta(minutes=SEARCH_MINUTES)
 
-    end_time = (
-        decision_time
-        + pd.Timedelta(
-            minutes=
-                SEARCH_MINUTES
-        )
+    data = load_market_candles(
+        ticker=ticker, start_time=start, end_time=end,
     )
+    valid = []
+    for candle in data["candles"]:
+        quote = parse_candle(candle)
+        bid, ask = quote["yes_bid"], quote["yes_ask"]
+        if bid is None or ask is None or not 0 <= bid <= ask <= 1:
+            continue
 
-    candle_data = (
-        load_market_candles(
-            ticker=
-                ticker,
+        timestamp = quote["timestamp"]
+        if calibration_quotes:
+            acceptable = (
+                decision - pd.Timedelta(minutes=2)
+                <= timestamp <= decision
+            )
+        else:
+            acceptable = decision < timestamp <= end
 
-            start_time=
-                decision_time,
+        if acceptable:
+            valid.append(quote)
 
-            end_time=
-                end_time
-        )
-    )
-
-    parsed = [
-
-        parse_candle(
-            candle
-        )
-
-        for candle
-        in candle_data[
-            "candles"
-        ]
-    ]
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Candle must END strictly after the decision timestamp.
-    #
-    # A 20:05 candle contains information from BEFORE 20:05,
-    # so 20:06 is the earliest acceptable complete candle.
-    # --------------------------------------------------------
-
-    valid_quotes = [
-
-        quote
-
-        for quote in parsed
-
-        if (
-            quote[
-                "timestamp"
-            ] > decision_time
-
-            and
-
-            quote[
-                "yes_bid"
-            ] is not None
-
-            and
-
-            quote[
-                "yes_ask"
-            ] is not None
-        )
-    ]
-
-    if not valid_quotes:
-
+    if not valid:
         return None
 
-    entry = (
-        valid_quotes[0]
-    )
-
-    entry[
-        "source"
-    ] = candle_data[
-        "source"
-    ]
-
-    entry[
-        "decision_time"
-    ] = decision_time
-
-    return entry
+    choose = max if calibration_quotes else min
+    quote = choose(valid, key=lambda q: q["timestamp"]).copy()
+    quote["source"] = data["source"]
+    quote["decision_time"] = decision
+    return quote
 
 
 # ============================================================
@@ -480,7 +310,8 @@ def get_market_entry_quote(
 def get_event_entry_quotes(
     target_date,
     decision_hour=20,
-    decision_minute=5
+    decision_minute=5,
+    calibration_quotes=False,
 ):
 
     event_info = (
@@ -499,20 +330,12 @@ def get_event_entry_quotes(
             "ticker"
         ]
 
-        quote = (
-            get_market_entry_quote(
-                ticker=
-                    ticker,
-
-                target_date=
-                    target_date,
-
-                decision_hour=
-                    decision_hour,
-
-                decision_minute=
-                    decision_minute
-            )
+        quote = get_market_entry_quote(
+            ticker=ticker,
+            target_date=target_date,
+            decision_hour=decision_hour,
+            decision_minute=decision_minute,
+            calibration_quotes=calibration_quotes,
         )
 
         if quote is None:

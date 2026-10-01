@@ -13,130 +13,53 @@ from src.database.db import (
     save_historical_market_entries
 )
 
+NYC_TIMEZONE = ZoneInfo("America/New_York")
+
 
 def backfill_market_history(
-    start_date,
-    end_date,
-    decision_hour=20,
-    decision_minute=5
+    start_date, end_date, decision_hour=20, decision_minute=5,
+    calibration_quotes=False,
 ):
+    saved_dates = skipped_dates = failed_dates = total_saved = 0
 
-    dates = pd.date_range(
-        start=start_date,
-        end=end_date,
-        freq="D"
-    )
-
-    total_saved = 0
-    successful_dates = 0
-    failed_dates = 0
-
-    print()
-    print("=" * 80)
-    print(
-        "KALSHI HISTORICAL MARKET BACKFILL"
-    )
-    print("=" * 80)
-
-    print(
-        f"Start: {start_date}"
-    )
-
-    print(
-        f"End:   {end_date}"
-    )
-
-    print(
-        f"Days:  {len(dates)}"
-    )
-
-    print()
-
-    for index, date in enumerate(
-        dates,
-        start=1
-    ):
-
-        target_date = (
-            date.strftime(
-                "%Y-%m-%d"
-            )
-        )
-
-        print(
-            f"[{index}/{len(dates)}] "
-            f"{target_date}"
-        )
+    for date in pd.date_range(start_date, end_date, freq="D"):
+        target_date = date.strftime("%Y-%m-%d")
+        print(f"Collecting {target_date}...", flush=True)
 
         try:
+            entries = get_event_entry_quotes(
+                target_date,
+                decision_hour=decision_hour,
+                decision_minute=decision_minute,
+                calibration_quotes=calibration_quotes,
+            )
 
-            entries = (
-                get_event_entry_quotes(
-                    target_date,
-                    decision_hour=
-                        decision_hour,
-                    decision_minute=
-                        decision_minute
+            if not entries or (
+                calibration_quotes and (
+                    len(entries) != 6
+                    or len({entry["ticker"] for entry in entries}) != 6
                 )
-            )
-
-            saved = (
-                save_historical_market_entries(
-                    entries
+            ):
+                skipped_dates += 1
+                print(f"  SKIPPED: {len(entries)} usable contract quotes.")
+            else:
+                saved = save_historical_market_entries(
+                    entries, calibration_quotes=calibration_quotes,
                 )
-            )
-
-            total_saved += saved
-
-            successful_dates += 1
-
-            print(
-                f"  Saved "
-                f"{saved} contracts."
-            )
+                saved_dates += 1
+                total_saved += saved
+                print(f"  Saved {saved} contracts.")
 
         except Exception as error:
-
             failed_dates += 1
+            print(f"  FAILED: {type(error).__name__}: {error}")
 
-            print(
-                f"  FAILED: "
-                f"{type(error).__name__}: "
-                f"{error}"
-            )
+        time.sleep(0.25)
 
-        # Small pause so we don't hammer
-        # Kalshi during the bulk download.
-        time.sleep(
-            0.25
-        )
-
-    print()
-    print("=" * 80)
-    print(
-        "BACKFILL COMPLETE"
-    )
-    print("=" * 80)
-
-    print(
-        f"Successful dates: "
-        f"{successful_dates}"
-    )
-
-    print(
-        f"Failed dates:     "
-        f"{failed_dates}"
-    )
-
-    print(
-        f"Contracts saved:  "
-        f"{total_saved}"
-    )
-
-
-NYC_TIMEZONE = ZoneInfo(
-    "America/New_York"
-)
+    print(f"Dates saved: {saved_dates}")
+    print(f"Dates skipped for quote coverage: {skipped_dates}")
+    print(f"Dates failed: {failed_dates}")
+    print(f"Contracts saved: {total_saved}")
 
 
 def get_default_refresh_range(

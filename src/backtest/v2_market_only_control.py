@@ -12,8 +12,8 @@ from src.backtest.v2_source_signal_test import (
 
 TRAIN_DATE_COUNT = 20
 
-HOLDOUT_START = "2026-09-11"
-HOLDOUT_END = "2026-09-26"
+HOLDOUT_START = "2026-09-01"
+HOLDOUT_END = "2026-09-30"
 
 NBM_BETA = -0.40
 

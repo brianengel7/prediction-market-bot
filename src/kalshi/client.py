@@ -8,6 +8,40 @@ BASE_URL = (
 
 REQUEST_TIMEOUT = 20
 
+MIN_REQUEST_INTERVAL = 1.0
+MAX_GET_ATTEMPTS = 6
+
+
+def kalshi_get(url, **kwargs):
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+
+    for attempt in range(MAX_GET_ATTEMPTS):
+        time.sleep(MIN_REQUEST_INTERVAL)
+
+        try:
+            result = requests.get(url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as error:
+            if attempt == MAX_GET_ATTEMPTS - 1:
+                raise
+            reason = type(error).__name__
+        else:
+            if result.status_code not in {429, 500, 502, 503, 504}:
+                result.raise_for_status()
+                return result
+
+            if attempt == MAX_GET_ATTEMPTS - 1:
+                result.raise_for_status()
+
+            reason = f"HTTP {result.status_code}"
+            result.close()
+
+        wait_seconds = min(5 * (2 ** attempt), 60)
+        print(
+            f"Kalshi {reason}: waiting {wait_seconds}s "
+            f"before attempt {attempt + 2}/{MAX_GET_ATTEMPTS}",
+            flush=True,
+        )
+        time.sleep(wait_seconds)
 
 def get_markets(
     series_ticker=None,

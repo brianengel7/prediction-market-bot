@@ -1407,221 +1407,105 @@ def get_market_snapshots(
 
     return dataframe
 
-def save_historical_market_entries(
-    entries
-):
-
+def save_historical_market_entries(entries, calibration_quotes=False):
     if not entries:
         return 0
 
-    created_at = (
-        pd.Timestamp.now(
-            tz="UTC"
-        ).isoformat()
-    )
+    if calibration_quotes:
+        if (
+            len(entries) != 6
+            or len({entry["ticker"] for entry in entries}) != 6
+            or len({
+                (entry["target_date"], str(entry["decision_time"]))
+                for entry in entries
+            }) != 1
+        ):
+            raise ValueError(
+                "Calibration requires one complete six-contract date."
+            )
 
-    saved_count = 0
+    now = pd.Timestamp.now(tz="UTC").isoformat()
+    metadata = [
+        "target_date", "event_ticker", "ticker", "title",
+        "strike_type", "floor_strike", "cap_strike",
+        "market_status", "result", "market_source",
+    ]
+    calibration_columns = [
+        "calibration_quote_time", "calibration_yes_bid",
+        "calibration_yes_ask", "calibration_candle_source",
+        "calibration_collected_at",
+    ]
+    payloads = []
+
+    for entry in entries:
+        payload = {field: entry.get(field) for field in metadata}
+        settlement = entry.get("settlement_value")
+        payload["settlement_value"] = (
+            None if settlement in (None, "") else float(settlement)
+        )
+        payload["decision_time"] = str(entry["decision_time"])
+        payload["created_at"] = now
+
+        if calibration_quotes:
+            timestamp = pd.Timestamp(entry["entry_time"])
+            decision = pd.Timestamp(entry["decision_time"])
+            age = (decision - timestamp).total_seconds() / 60
+            bid, ask = float(entry["yes_bid"]), float(entry["yes_ask"])
+
+            if not 0 <= age <= 2 or not 0 <= bid <= ask <= 1:
+                raise ValueError(
+                    "Invalid calibration quote or quote age."
+                )
+
+            payload.update({
+                "calibration_quote_time": str(timestamp),
+                "calibration_yes_bid": bid,
+                "calibration_yes_ask": ask,
+                "calibration_candle_source": entry.get("candle_source"),
+                "calibration_collected_at": now,
+            })
+            updates = calibration_columns.copy()
+
+            if str(payload["market_status"]).lower() == "finalized":
+                updates += [
+                    field for field in
+                    ("market_status", "result", "settlement_value")
+                    if payload[field] not in (None, "")
+                ]
+        else:
+            payload.update({
+                "entry_time": str(entry["entry_time"]),
+                "yes_bid": entry.get("yes_bid"),
+                "yes_ask": entry.get("yes_ask"),
+                "no_bid": entry.get("no_bid"),
+                "no_ask": entry.get("no_ask"),
+                "candle_source": entry.get("candle_source"),
+            })
+            updates = [
+                field for field in payload
+                if field not in ("target_date", "ticker", "decision_time")
+            ]
+
+        payloads.append((payload, updates))
 
     with get_connection() as connection:
-
-        for entry in entries:
-
-            settlement_value = (
-                entry.get(
-                    "settlement_value"
-                )
+        for payload, updates in payloads:
+            columns = list(payload)
+            placeholders = ", ".join("?" for _ in columns)
+            assignments = ", ".join(
+                f"{field} = excluded.{field}" for field in updates
             )
-
-            if settlement_value in (
-                None,
-                ""
-            ):
-                settlement_value = None
-
-            else:
-                settlement_value = float(
-                    settlement_value
-                )
-
             connection.execute(
-                """
-                INSERT INTO historical_market_entries (
-                    target_date,
-                    event_ticker,
-
-                    ticker,
-                    title,
-
-                    strike_type,
-                    floor_strike,
-                    cap_strike,
-
-                    market_status,
-                    result,
-                    settlement_value,
-
-                    decision_time,
-                    entry_time,
-
-                    yes_bid,
-                    yes_ask,
-                    no_bid,
-                    no_ask,
-
-                    market_source,
-                    candle_source,
-
-                    created_at
-                )
-
-                VALUES (
-                    ?, ?,
-                    ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?,
-                    ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?,
-                    ?
-                )
-
-                ON CONFLICT (
-                    target_date,
-                    ticker,
-                    decision_time
-                )
-
-                DO UPDATE SET
-                    event_ticker =
-                        excluded.event_ticker,
-
-                    title =
-                        excluded.title,
-
-                    strike_type =
-                        excluded.strike_type,
-
-                    floor_strike =
-                        excluded.floor_strike,
-
-                    cap_strike =
-                        excluded.cap_strike,
-
-                    market_status =
-                        excluded.market_status,
-
-                    result =
-                        excluded.result,
-
-                    settlement_value =
-                        excluded.settlement_value,
-
-                    entry_time =
-                        excluded.entry_time,
-
-                    yes_bid =
-                        excluded.yes_bid,
-
-                    yes_ask =
-                        excluded.yes_ask,
-
-                    no_bid =
-                        excluded.no_bid,
-
-                    no_ask =
-                        excluded.no_ask,
-
-                    market_source =
-                        excluded.market_source,
-
-                    candle_source =
-                        excluded.candle_source,
-
-                    created_at =
-                        excluded.created_at
+                f"""
+                INSERT INTO historical_market_entries ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT (target_date, ticker, decision_time)
+                DO UPDATE SET {assignments}
                 """,
-                (
-                    entry[
-                        "target_date"
-                    ],
-
-                    entry[
-                        "event_ticker"
-                    ],
-
-                    entry[
-                        "ticker"
-                    ],
-
-                    entry.get(
-                        "title"
-                    ),
-
-                    entry.get(
-                        "strike_type"
-                    ),
-
-                    entry.get(
-                        "floor_strike"
-                    ),
-
-                    entry.get(
-                        "cap_strike"
-                    ),
-
-                    entry.get(
-                        "market_status"
-                    ),
-
-                    entry.get(
-                        "result"
-                    ),
-
-                    settlement_value,
-
-                    str(
-                        entry[
-                            "decision_time"
-                        ]
-                    ),
-
-                    str(
-                        entry[
-                            "entry_time"
-                        ]
-                    ),
-
-                    entry.get(
-                        "yes_bid"
-                    ),
-
-                    entry.get(
-                        "yes_ask"
-                    ),
-
-                    entry.get(
-                        "no_bid"
-                    ),
-
-                    entry.get(
-                        "no_ask"
-                    ),
-
-                    entry.get(
-                        "market_source"
-                    ),
-
-                    entry.get(
-                        "candle_source"
-                    ),
-
-                    created_at
-                )
+                tuple(payload[field] for field in columns),
             )
 
-            saved_count += 1
-
-    return saved_count
+    return len(payloads)
 
 def get_historical_market_entries(
     start_date=None,

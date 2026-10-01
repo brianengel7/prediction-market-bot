@@ -59,259 +59,120 @@ DECISION_MINUTE_UTC = 5
 SAVE_WINDOW_MINUTES = 15
 
 def load_market_only_calibration_history():
-
-    history = (
-        get_historical_market_entries()
-        .copy()
-    )
-
-    if history.empty:
-
-        raise RuntimeError(
-            "No historical Kalshi entries found."
+    history = get_historical_market_entries().copy()
+    for column in ("decision_time", "entry_time", "calibration_quote_time"):
+        history[column] = pd.to_datetime(
+            history[column], utc=True, errors="coerce",
         )
-
-    # --------------------------------------------------------
-    # We only want the exact strategy decision time:
-    # 20:05 UTC.
-    # --------------------------------------------------------
-
+    history["target_date"] = pd.to_datetime(
+        history["target_date"], errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
     history = history[
         (history["decision_time"].dt.hour == DECISION_HOUR_UTC)
         & (history["decision_time"].dt.minute == DECISION_MINUTE_UTC)
-        & (history["entry_time"] >= history["decision_time"])
-        & (
-            history["entry_time"]
-            <= history["decision_time"]
-            + pd.Timedelta(minutes=MAX_QUOTE_DELAY_MINUTES)
-        )
+        & (history["decision_time"].dt.second == 0)
+        & (history["decision_time"].dt.microsecond == 0)
     ].copy()
 
-    if history.empty:
+    def build_snapshot(group, source):
+        decision = group["decision_time"].iloc[0]
 
-        raise RuntimeError(
-            "No 20:05 UTC historical entries found."
-        )
-
-    history[
-        "target_date"
-    ] = pd.to_datetime(
-        history[
-            "target_date"
-        ]
-    ).dt.strftime(
-        "%Y-%m-%d"
-    )
-
-    calibration_rows = []
-
-    # --------------------------------------------------------
-    # Build one normalized six-contract distribution per day.
-    # --------------------------------------------------------
-
-    for (
-        target_date,
-        group
-    ) in history.groupby(
-        "target_date"
-    ):
-
-        group = (
-            group.copy()
-            .reset_index(
-                drop=True
+        if source == "calibration":
+            timestamps = group["calibration_quote_time"]
+            bid_column, ask_column = (
+                "calibration_yes_bid", "calibration_yes_ask"
             )
-        )
+            asof = decision
+            if not timestamps.le(decision).all():
+                return None
+        else:
+            timestamps = group["entry_time"]
+            bid_column, ask_column = "yes_bid", "yes_ask"
+            if not (
+                timestamps.ge(decision)
+                & timestamps.le(decision + pd.Timedelta(minutes=2))
+            ).all():
+                return None
 
-        if len(
-            group
-        ) != 6:
-            continue
+            # Modeled snapshot time retains the later information time.
+            asof = timestamps.max()
 
-        # ----------------------------------------------------
-        # Require complete midpoint quotes.
-        # ----------------------------------------------------
+        ages = (asof - timestamps).dt.total_seconds() / 60
+        bid = pd.to_numeric(group[bid_column], errors="coerce")
+        ask = pd.to_numeric(group[ask_column], errors="coerce")
+        if not (
+            ages.between(0, 2)
+            & bid.between(0, 1)
+            & ask.between(0, 1)
+            & bid.le(ask)
+        ).all():
+            return None
 
+        mids = (bid + ask) / 2
+        if mids.sum() <= 0:
+            return None
+
+        snapshot = group.copy()
+        snapshot["market_probability"] = mids / mids.sum()
+        snapshot["quote_source"] = source
+        snapshot["quote_time_utc"] = timestamps
+        snapshot["calibration_asof_utc"] = asof
+        snapshot["quote_age_minutes"] = ages
+        return snapshot
+
+    rows = []
+    for target_date, group in history.groupby("target_date"):
+        group = group.copy()
         if (
-            group[
-                "yes_bid"
-            ].isna().any()
-            or
-            group[
-                "yes_ask"
-            ].isna().any()
+            len(group) != 6
+            or group["ticker"].nunique() != 6
+            or group["decision_time"].nunique() != 1
+            or not group["market_status"].astype(str).str.lower()
+                .eq("finalized").all()
         ):
             continue
 
-        group[
-            "market_mid"
-        ] = (
-            group[
-                "yes_bid"
-            ].astype(
-                float
-            )
-            +
-            group[
-                "yes_ask"
-            ].astype(
-                float
-            )
-        ) / 2.0
-
-        raw_mid_sum = float(
-            group[
-                "market_mid"
-            ].sum()
+        outcomes = (
+            group["result"].astype(str).str.strip().str.lower()
+            .map({"yes": 1.0, "no": 0.0})
         )
-
-        if raw_mid_sum <= 0:
-            continue
-
-        group[
-            "market_probability"
-        ] = (
-            group[
-                "market_mid"
-            ]
-            /
-            raw_mid_sum
+        settlement = pd.to_numeric(
+            group["settlement_value"], errors="coerce",
         )
-
-        # ----------------------------------------------------
-        # Convert settlement into contract outcome.
-        # ----------------------------------------------------
-
-        outcomes = []
-
-        for _, row in (
-            group.iterrows()
-        ):
-
-            result = row.get(
-                "result"
-            )
-
-            result_text = (
-                str(
-                    result
-                )
-                .strip()
-                .lower()
-            )
-
-            if result_text == "yes":
-
-                outcome = 1.0
-
-            elif result_text == "no":
-
-                outcome = 0.0
-
-            else:
-
-                settlement_value = row.get(
-                    "settlement_value"
-                )
-
-                if pd.isna(
-                    settlement_value
-                ):
-
-                    outcome = np.nan
-
-                else:
-
-                    settlement_value = float(
-                        settlement_value
-                    )
-
-                    if np.isclose(
-                        settlement_value,
-                        1.0
-                    ):
-
-                        outcome = 1.0
-
-                    elif np.isclose(
-                        settlement_value,
-                        0.0
-                    ):
-
-                        outcome = 0.0
-
-                    else:
-
-                        outcome = np.nan
-
-            outcomes.append(
-                outcome
-            )
-
-        group[
-            "outcome"
-        ] = outcomes
-
-        if group[
-            "outcome"
-        ].isna().any():
-
-            continue
-
-        # Exactly one bucket should have settled YES.
-        if not np.isclose(
-            group[
-                "outcome"
-            ].sum(),
-            1.0
-        ):
-
-            continue
-
-        for _, row in (
-            group.iterrows()
-        ):
-
-            calibration_rows.append({
-
-                "target_date":
-                    target_date,
-
-                "ticker":
-                    row[
-                        "ticker"
-                    ],
-
-                "market_probability":
-                    float(
-                        row[
-                            "market_probability"
-                        ]
-                    ),
-
-                "outcome":
-                    float(
-                        row[
-                            "outcome"
-                        ]
-                    )
-            })
-
-    dataframe = pd.DataFrame(
-        calibration_rows
-    )
-
-    if dataframe.empty:
-        raise RuntimeError(
-            "No complete settled calibration dates "
-            "could be constructed."
+        fallback = pd.Series(
+            np.where(
+                np.isclose(settlement, 1), 1.0,
+                np.where(np.isclose(settlement, 0), 0.0, np.nan),
+            ),
+            index=group.index,
         )
+        outcomes = outcomes.fillna(fallback)
+        if outcomes.isna().any() or not np.isclose(outcomes.sum(), 1):
+            continue
+        group["outcome"] = outcomes
 
+        snapshot = build_snapshot(group, "calibration")
+        if snapshot is None:
+            snapshot = build_snapshot(group, "entry_window")
+        if snapshot is None:
+            continue
+
+        rows.extend(snapshot[[
+            "target_date", "ticker", "market_probability", "outcome",
+            "quote_source", "quote_time_utc", "calibration_asof_utc",
+            "quote_age_minutes",
+        ]].to_dict("records"))
+
+    dataframe = pd.DataFrame(rows, columns=[
+        "target_date", "ticker", "market_probability", "outcome",
+        "quote_source", "quote_time_utc", "calibration_asof_utc",
+        "quote_age_minutes",
+    ])
     complete_dates = dataframe["target_date"].nunique()
     if complete_dates < LOOKBACK_DAYS:
         raise RuntimeError(
-            f"Only {complete_dates} complete 20:05–20:07 UTC "
-            f"calibration dates; {LOOKBACK_DAYS} are required."
+            f"Only {complete_dates} complete settled calibration dates; "
+            f"{LOOKBACK_DAYS} are required."
         )
 
     return dataframe
