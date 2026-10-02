@@ -21,10 +21,12 @@ from src.kalshi.trading_client import (
 )
 
 
+MAX_ORDER_LIFETIME_MINUTES = 30
 MINIMUM_NET_EDGE = 0.025
 MAX_CONTRACTS = 1
 MAX_LIVE_CONTRACTS_PER_TARGET_DATE = 1
 MAX_DECISION_AGE_MINUTES = 15
+MINIMUM_EXPECTED_RETURN_ON_RISK = 0.10
 
 
 def live_trading_enabled():
@@ -206,8 +208,24 @@ def validate_live_trade(
         "side",
         "decision_time",
         "entry_price",
-        "net_edge"
+        "adjusted_probability",
+        "fee",
+        "total_cost",
+        "net_edge",
+        "expected_return_on_risk",
+        "trade_taken",
     )
+
+    if not bool(
+        trade[
+            "trade_taken"
+        ]
+    ):
+
+        raise RuntimeError(
+            "Live trade rejected: "
+            "strategy decision is PASS."
+        )
 
     for field in required_fields:
 
@@ -218,6 +236,16 @@ def validate_live_trade(
                 f"missing {field}."
             )
 
+    if not bool(
+        trade[
+            "trade_taken"
+        ]
+    ):
+
+        raise RuntimeError(
+            "Live trade rejected: "
+            "strategy decision is PASS."
+        )
     side = (
         str(
             trade["side"]
@@ -275,11 +303,138 @@ def validate_live_trade(
             f"{entry_price:.4f}."
         )
 
+    adjusted_probability = float(
+        trade[
+            "adjusted_probability"
+        ]
+    )
+
+    fee = float(
+        trade[
+            "fee"
+        ]
+    )
+
+    total_cost = float(
+        trade[
+            "total_cost"
+        ]
+    )
+
+    expected_return_on_risk = float(
+        trade[
+            "expected_return_on_risk"
+        ]
+    )
+
     net_edge = float(
         trade[
             "net_edge"
         ]
     )
+
+
+    values = (
+        adjusted_probability,
+        fee,
+        total_cost,
+        net_edge,
+        expected_return_on_risk,
+    )
+
+    if not all(
+        math.isfinite(value)
+        for value in values
+    ):
+
+        raise RuntimeError(
+            "Live trade rejected: "
+            "non-finite trade economics."
+        )
+
+    calculated_total_cost = (
+        entry_price
+        +
+        fee
+    )
+
+    if not math.isclose(
+        total_cost,
+        calculated_total_cost,
+        rel_tol=0.0,
+        abs_tol=1e-9
+    ):
+
+        raise RuntimeError(
+            "Live trade rejected: "
+            "total cost does not equal "
+            "entry price + fee."
+        )
+
+
+    calculated_net_edge = (
+        adjusted_probability
+        -
+        total_cost
+    )
+
+    if not math.isclose(
+        net_edge,
+        calculated_net_edge,
+        rel_tol=0.0,
+        abs_tol=1e-9
+    ):
+
+        raise RuntimeError(
+            "Live trade rejected: "
+            "net edge is inconsistent "
+            "with probability and cost."
+        )
+
+
+    calculated_expected_roi = (
+        net_edge
+        /
+        total_cost
+    )
+
+    if not math.isclose(
+        expected_return_on_risk,
+        calculated_expected_roi,
+        rel_tol=0.0,
+        abs_tol=1e-9
+    ):
+
+        raise RuntimeError(
+            "Live trade rejected: "
+            "expected return/risk is inconsistent."
+        )
+
+    minimum_expected_roi = float(
+        trade.get(
+            "minimum_expected_return_on_risk",
+            MINIMUM_EXPECTED_RETURN_ON_RISK
+        )
+    )
+
+    required_expected_roi = max(
+        MINIMUM_EXPECTED_RETURN_ON_RISK,
+        minimum_expected_roi
+    )
+
+    if (
+        expected_return_on_risk
+        <
+        required_expected_roi
+    ):
+
+        raise RuntimeError(
+            f"Live trade rejected: "
+            f"expected return/risk "
+            f"{expected_return_on_risk:.2%} "
+            f"is below required "
+            f"{required_expected_roi:.2%}."
+        )
 
     minimum_edge = float(
         trade.get(
@@ -382,6 +537,21 @@ def validate_live_trade(
 
         "entry_price":
             entry_price,
+
+        "decision_time":
+            decision_time,
+
+        "adjusted_probability":
+            adjusted_probability,
+
+        "fee":
+            fee,
+
+        "total_cost":
+            total_cost,
+
+        "expected_return_on_risk":
+            expected_return_on_risk,
 
         "net_edge":
             net_edge,
@@ -1015,6 +1185,38 @@ def execute_live_trade(
     result = None
     try:
 
+        expiration_time = int(
+            (
+                validated[
+                    "decision_time"
+                ]
+                +
+                pd.Timedelta(
+                    minutes=
+                        MAX_ORDER_LIFETIME_MINUTES
+                )
+            )
+            .timestamp()
+        )
+
+        now_timestamp = int(
+            pd.Timestamp.now(
+                tz="UTC"
+            ).timestamp()
+        )
+
+        if (
+            expiration_time
+            <=
+            now_timestamp
+        ):
+
+            raise RuntimeError(
+                "Live trade rejected: "
+                "order expiration time "
+                "has already passed."
+            )
+
         result = place_order(
             ticker=
                 validated["ticker"],
@@ -1033,7 +1235,13 @@ def execute_live_trade(
                 ],
 
             client_order_id=
-                client_order_id
+                client_order_id,
+
+            time_in_force=
+                "good_till_canceled",
+
+            expiration_time=
+                expiration_time
         )
 
         fill_count = float(
@@ -1048,6 +1256,19 @@ def execute_live_trade(
                 "remaining_count"
             )
             or 0
+        )
+
+        expiration_utc = (
+            pd.Timestamp(
+                expiration_time,
+                unit="s",
+                tz="UTC"
+            )
+        )
+
+        print(
+            f"Order expires: "
+            f"{expiration_utc}"
         )
 
         # ----------------------------------------------------

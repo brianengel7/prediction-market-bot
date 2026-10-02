@@ -8,6 +8,10 @@ load_dotenv(
     override=False,
 )
 import pandas as pd
+from src.kalshi.decision_timing import (
+    historical_calibration_age_limit,
+    SYNC_CALIBRATION_PREFIX,
+)
 
 
 DATABASE_PATH = Path(__file__).parent / "prediction_market.db"
@@ -51,6 +55,45 @@ def read_dataframe(query, connection, params=None):
         cursor.fetchall(),
         columns=[column[0] for column in cursor.description],
     )
+
+def ensure_market_calibration_schema(connection):
+    if isinstance(connection, sqlite3.Connection):
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(historical_market_entries)"
+            ).fetchall()
+        }
+    else:
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT column_name "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'historical_market_entries'"
+            ).fetchall()
+        }
+
+    if not columns:
+        raise RuntimeError(
+            "historical_market_entries was not found."
+        )
+
+    additions = {
+        "calibration_quote_time": "TEXT",
+        "calibration_yes_bid": "DOUBLE PRECISION",
+        "calibration_yes_ask": "DOUBLE PRECISION",
+        "calibration_candle_source": "TEXT",
+        "calibration_collected_at": "TEXT",
+    }
+
+    for column, datatype in additions.items():
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE historical_market_entries "
+                f"ADD COLUMN {column} {datatype}"
+            )
 
 
 def initialize_database():
@@ -1407,9 +1450,24 @@ def get_market_snapshots(
 
     return dataframe
 
-def save_historical_market_entries(entries, calibration_quotes=False):
+def save_historical_market_entries(
+    entries,
+    calibration_quotes=False,
+    calibration_max_age_minutes=2,
+):
     if not entries:
         return 0
+
+    if not all(
+        str(entry.get("candle_source", "")).startswith(
+            SYNC_CALIBRATION_PREFIX
+        )
+        for entry in entries
+    ):
+        raise ValueError(
+            "Calibration writes must come from "
+            "collect_synchronized_quotes.py."
+        )
 
     if calibration_quotes:
         if (
@@ -1423,7 +1481,15 @@ def save_historical_market_entries(entries, calibration_quotes=False):
             raise ValueError(
                 "Calibration requires one complete six-contract date."
             )
-
+    age_limit = (
+        historical_calibration_age_limit(
+            [entry.get("candle_source") for entry in entries],
+            [entry["entry_time"] for entry in entries],
+            default_minutes=calibration_max_age_minutes,
+        )
+        if calibration_quotes
+        else 2
+    )
     now = pd.Timestamp.now(tz="UTC").isoformat()
     metadata = [
         "target_date", "event_ticker", "ticker", "title",
@@ -1452,7 +1518,7 @@ def save_historical_market_entries(entries, calibration_quotes=False):
             age = (decision - timestamp).total_seconds() / 60
             bid, ask = float(entry["yes_bid"]), float(entry["yes_ask"])
 
-            if not 0 <= age <= 2 or not 0 <= bid <= ask <= 1:
+            if not 0 <= age <= age_limit or not 0 <= bid <= ask <= 1:
                 raise ValueError(
                     "Invalid calibration quote or quote age."
                 )
@@ -1464,6 +1530,7 @@ def save_historical_market_entries(entries, calibration_quotes=False):
                 "calibration_candle_source": entry.get("candle_source"),
                 "calibration_collected_at": now,
             })
+            payload["entry_time"] = str(timestamp)
             updates = calibration_columns.copy()
 
             if str(payload["market_status"]).lower() == "finalized":

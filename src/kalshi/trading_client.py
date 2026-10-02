@@ -330,7 +330,9 @@ def convert_trade_to_v2_order(
     side,
     entry_price,
     contracts=1,
-    client_order_id=None
+    client_order_id=None,
+    time_in_force="good_till_canceled",
+    expiration_time=None
 ):
 
     side = (
@@ -381,7 +383,51 @@ def convert_trade_to_v2_order(
             uuid.uuid4()
         )
 
-    return {
+    time_in_force = (
+        str(time_in_force)
+        .strip()
+        .lower()
+    )
+
+    valid_time_in_force = {
+        "fill_or_kill",
+        "good_till_canceled",
+        "immediate_or_cancel",
+    }
+
+    if time_in_force not in valid_time_in_force:
+        raise ValueError(
+            f"Invalid time_in_force: "
+            f"{time_in_force}"
+        )
+
+    if expiration_time is not None:
+
+        expiration_time = int(
+            expiration_time
+        )
+
+        if (
+            time_in_force
+            !=
+            "good_till_canceled"
+        ):
+            raise ValueError(
+                "expiration_time requires "
+                "good_till_canceled."
+            )
+
+        if (
+            expiration_time
+            <=
+            int(time.time())
+        ):
+            raise ValueError(
+                "expiration_time must be "
+                "in the future."
+            )
+
+    order = {
 
         "ticker":
             ticker,
@@ -400,14 +446,25 @@ def convert_trade_to_v2_order(
             ),
 
         "time_in_force":
-            "fill_or_kill",
+            time_in_force,
 
         "self_trade_prevention_type":
             "taker_at_cross",
 
+        "cancel_order_on_pause":
+            True,
+
         "client_order_id":
             client_order_id
     }
+
+    if expiration_time is not None:
+
+        order[
+            "expiration_time"
+        ] = expiration_time
+
+    return order
 
 
 # ============================================================
@@ -420,6 +477,8 @@ def place_order(
     entry_price,
     contracts=1,
     client_order_id=None,
+    time_in_force="good_till_canceled",
+    expiration_time=None,
     timeout=15
 ):
     """
@@ -455,7 +514,13 @@ def place_order(
                 contracts,
 
             client_order_id=
-                client_order_id
+                client_order_id,
+
+            time_in_force=
+                time_in_force,
+
+            expiration_time=
+                expiration_time
         )
     )
 

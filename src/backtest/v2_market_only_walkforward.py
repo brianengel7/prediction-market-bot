@@ -1,11 +1,15 @@
 import numpy as np
 import pandas as pd
 
-from src.backtest.v2_source_signal_test import load_dataset
+from src.backtest.v2_market_only_history import (
+    load_synchronized_market_history
+)
 
 from src.backtest.v2_market_only_control import (
     fit_market_alpha,
-    market_only_probabilities
+    market_only_probabilities,
+    kalshi_probabilities,
+    score_model,
 )
 
 from src.backtest.v2_market_only_strategy import (
@@ -23,13 +27,11 @@ from src.kalshi.fees import (
 
 LOOKBACK_DAYS = 20
 
+EVALUATION_DATE_COUNT = 30
+
 MIN_NET_EDGE = 0.025
 
-EVALUATION_START = "2026-08-19"
-EVALUATION_END = "2026-09-26"
-
-PREVIOUS_HOLDOUT_START = "2026-09-11"
-PREVIOUS_HOLDOUT_END = "2026-09-26"
+MIN_EXPECTED_RETURN_ON_RISK = 0.10
 
 
 # ============================================================
@@ -38,8 +40,13 @@ PREVIOUS_HOLDOUT_END = "2026-09-26"
 
 def get_training_dates(
     all_dates,
-    target_date
+    target_date,
+    lookback_days=None
 ):
+
+    if lookback_days is None:
+        lookback_days = LOOKBACK_DAYS
+
     """
     Target date = day whose maximum temperature is traded.
 
@@ -77,12 +84,12 @@ def get_training_dates(
 
     if len(
         eligible_dates
-    ) < LOOKBACK_DAYS:
+    ) < lookback_days:
 
         return []
 
     return eligible_dates[
-        -LOOKBACK_DAYS:
+        -lookback_days:
     ]
 
 
@@ -189,6 +196,14 @@ def build_daily_candidates(
                 total_cost
             )
 
+            expected_return_on_risk = (
+                net_edge
+                /
+                total_cost
+                if total_cost > 0
+                else float("-inf")
+            )
+
             won = (
                 outcome == 1
             )
@@ -214,6 +229,9 @@ def build_daily_candidates(
 
                 "adjusted_probability":
                     yes_fair,
+                
+                "expected_return_on_risk":
+                    expected_return_on_risk,
 
                 "entry_price":
                     yes_ask,
@@ -282,6 +300,14 @@ def build_daily_candidates(
                 total_cost
             )
 
+            expected_return_on_risk = (
+                net_edge
+                /
+                total_cost
+                if total_cost > 0
+                else float("-inf")
+            )
+
             won = (
                 outcome == 0
             )
@@ -324,6 +350,9 @@ def build_daily_candidates(
                 "net_edge":
                     net_edge,
 
+                "expected_return_on_risk":
+                     expected_return_on_risk,
+
                 "won":
                     won,
 
@@ -357,29 +386,78 @@ def build_daily_candidates(
 def run_walkforward(
     dataframe
 ):
+
     all_dates = sorted(
         dataframe[
             "target_date"
         ].unique()
     )
 
-    decisions = []
+    # --------------------------------------------------------
+    # Determine all dates that have a full 20-date
+    # historical training window.
+    # --------------------------------------------------------
+
+    eligible_evaluation_dates = []
 
     for target_date in all_dates:
 
+        training_dates = (
+            get_training_dates(
+                all_dates=
+                    all_dates,
+
+                target_date=
+                    target_date
+            )
+        )
+
         if (
-            target_date
-            <
-            EVALUATION_START
-            or
-            target_date
-            >
-            EVALUATION_END
+            len(training_dates)
+            ==
+            LOOKBACK_DAYS
         ):
-            continue
+
+            eligible_evaluation_dates.append(
+                target_date
+            )
+
+    if (
+        len(
+            eligible_evaluation_dates
+        )
+        <
+        EVALUATION_DATE_COUNT
+    ):
+
+        raise RuntimeError(
+            f"Only "
+            f"{len(eligible_evaluation_dates)} "
+            f"eligible walk-forward dates; "
+            f"{EVALUATION_DATE_COUNT} required."
+        )
+
+    # --------------------------------------------------------
+    # Use the 30 most recent eligible dates.
+    # --------------------------------------------------------
+
+    evaluation_dates = (
+        eligible_evaluation_dates[
+            -EVALUATION_DATE_COUNT:
+        ]
+    )
+
+    decisions = []
+
+    # --------------------------------------------------------
+    # Walk forward through EACH test date.
+    # --------------------------------------------------------
+
+    for target_date in evaluation_dates:
 
         # ----------------------------------------------------
-        # Strict historical training window
+        # Rebuild rolling 20-date training window
+        # for THIS target date.
         # ----------------------------------------------------
 
         training_dates = (
@@ -392,9 +470,11 @@ def run_walkforward(
             )
         )
 
-        if len(
-            training_dates
-        ) < LOOKBACK_DAYS:
+        if (
+            len(training_dates)
+            <
+            LOOKBACK_DAYS
+        ):
 
             continue
 
@@ -455,6 +535,51 @@ def run_walkforward(
 
             continue
 
+        # ----------------------------------------------------
+        # OUT-OF-SAMPLE PROBABILITY SCORING
+        #
+        # Alpha was fitted entirely from prior dates above.
+        # We now score today's six-contract distribution
+        # without using today's outcome during fitting.
+        # ----------------------------------------------------
+
+        kalshi_scores = (
+            score_model(
+                daily_data,
+                kalshi_probabilities
+            )
+        )
+
+        adjusted_scores = (
+            score_model(
+                daily_data,
+
+                lambda group:
+                    market_only_probabilities(
+                        group,
+                        alpha
+                    )
+            )
+        )
+
+        if (
+            len(kalshi_scores) != 1
+            or
+            len(adjusted_scores) != 1
+        ):
+            raise RuntimeError(
+                f"Could not score probability "
+                f"distribution for {target_date}."
+            )
+
+        kalshi_score = (
+            kalshi_scores.iloc[0]
+        )
+
+        adjusted_score = (
+            adjusted_scores.iloc[0]
+        )
+
         candidates = (
             build_daily_candidates(
                 daily_data=
@@ -468,17 +593,40 @@ def run_walkforward(
         if not candidates:
             continue
 
-        best = candidates[
-            0
+        qualifying_candidates = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate[
+                    "net_edge"
+                ]
+                >=
+                MIN_NET_EDGE
+                and
+                candidate[
+                    "expected_return_on_risk"
+                ]
+                >=
+                MIN_EXPECTED_RETURN_ON_RISK
+            )
         ]
 
-        trade_taken = (
-            best[
-                "net_edge"
+
+        if qualifying_candidates:
+
+            best = qualifying_candidates[
+                0
             ]
-            >=
-            MIN_NET_EDGE
-        )
+
+            trade_taken = True
+
+        else:
+
+            best = candidates[
+                0
+            ]
+
+            trade_taken = False
 
         decision = {
 
@@ -512,6 +660,11 @@ def run_walkforward(
                     ]
                 ),
 
+            "expected_return_on_risk":
+                best[
+                    "expected_return_on_risk"
+                ],
+
             "ticker":
                 best[
                     "ticker"
@@ -531,6 +684,48 @@ def run_walkforward(
                 best[
                     "adjusted_probability"
                 ],
+
+            "kalshi_brier":
+                float(
+                    kalshi_score[
+                        "brier"
+                    ]
+                ),
+
+            "adjusted_brier":
+                float(
+                    adjusted_score[
+                        "brier"
+                    ]
+                ),
+
+            "kalshi_log_loss":
+                float(
+                    kalshi_score[
+                        "log_loss"
+                    ]
+                ),
+
+            "adjusted_log_loss":
+                float(
+                    adjusted_score[
+                        "log_loss"
+                    ]
+                ),
+
+            "kalshi_winner_probability":
+                float(
+                    kalshi_score[
+                        "winner_probability"
+                    ]
+                ),
+
+            "adjusted_winner_probability":
+                float(
+                    adjusted_score[
+                        "winner_probability"
+                    ]
+                ),
 
             "entry_price":
                 best[
@@ -828,6 +1023,233 @@ def summarize_period(
             f"ROI {side_roi:+.2%}"
         )
 
+def summarize_probability_quality(
+    decisions
+):
+
+    required = [
+        "kalshi_brier",
+        "adjusted_brier",
+        "kalshi_log_loss",
+        "adjusted_log_loss",
+        "kalshi_winner_probability",
+        "adjusted_winner_probability",
+    ]
+
+    valid = (
+        decisions[
+            required
+        ]
+        .dropna()
+        .copy()
+    )
+
+    if valid.empty:
+
+        print()
+        print(
+            "No probability-quality "
+            "observations available."
+        )
+
+        return
+
+    raw_brier = float(
+        valid[
+            "kalshi_brier"
+        ].mean()
+    )
+
+    adjusted_brier = float(
+        valid[
+            "adjusted_brier"
+        ].mean()
+    )
+
+    raw_log = float(
+        valid[
+            "kalshi_log_loss"
+        ].mean()
+    )
+
+    adjusted_log = float(
+        valid[
+            "adjusted_log_loss"
+        ].mean()
+    )
+
+    raw_winner_probability = float(
+        valid[
+            "kalshi_winner_probability"
+        ].mean()
+    )
+
+    adjusted_winner_probability = float(
+        valid[
+            "adjusted_winner_probability"
+        ].mean()
+    )
+
+    brier_improvement = (
+        raw_brier
+        -
+        adjusted_brier
+    )
+
+    log_improvement = (
+        raw_log
+        -
+        adjusted_log
+    )
+
+    brier_improvement_pct = (
+        brier_improvement
+        /
+        raw_brier
+        if raw_brier > 0
+        else 0.0
+    )
+
+    log_improvement_pct = (
+        log_improvement
+        /
+        raw_log
+        if raw_log > 0
+        else 0.0
+    )
+
+    brier_better_days = int(
+        (
+            valid[
+                "adjusted_brier"
+            ]
+            <
+            valid[
+                "kalshi_brier"
+            ]
+        ).sum()
+    )
+
+    log_better_days = int(
+        (
+            valid[
+                "adjusted_log_loss"
+            ]
+            <
+            valid[
+                "kalshi_log_loss"
+            ]
+        ).sum()
+    )
+
+    total_days = len(
+        valid
+    )
+
+    print()
+    print("=" * 90)
+    print(
+        "OUT-OF-SAMPLE PROBABILITY QUALITY"
+    )
+    print("=" * 90)
+
+    print(
+        f"Evaluation dates:              "
+        f"{total_days}"
+    )
+
+    print()
+
+    print(
+        f"Raw Kalshi Brier:             "
+        f"{raw_brier:.4f}"
+    )
+
+    print(
+        f"Rolling-alpha Brier:          "
+        f"{adjusted_brier:.4f}"
+    )
+
+    print(
+        f"Brier improvement:            "
+        f"{brier_improvement:+.4f} "
+        f"({brier_improvement_pct:+.2%})"
+    )
+
+    print()
+
+    print(
+        f"Raw Kalshi log loss:          "
+        f"{raw_log:.4f}"
+    )
+
+    print(
+        f"Rolling-alpha log loss:       "
+        f"{adjusted_log:.4f}"
+    )
+
+    print(
+        f"Log-loss improvement:         "
+        f"{log_improvement:+.4f} "
+        f"({log_improvement_pct:+.2%})"
+    )
+
+    print()
+
+    print(
+        f"Raw winner probability:       "
+        f"{raw_winner_probability:.2%}"
+    )
+
+    print(
+        f"Adjusted winner probability:  "
+        f"{adjusted_winner_probability:.2%}"
+    )
+
+    print()
+
+    print(
+        f"Alpha lower Brier:            "
+        f"{brier_better_days}/{total_days} days"
+    )
+
+    print(
+        f"Alpha lower log loss:         "
+        f"{log_better_days}/{total_days} days"
+    )
+
+    print()
+
+    if (
+        adjusted_brier < raw_brier
+        and
+        adjusted_log < raw_log
+    ):
+
+        print(
+            "RESULT: rolling-alpha probabilities "
+            "beat raw Kalshi on BOTH aggregate "
+            "out-of-sample scoring metrics."
+        )
+
+    elif (
+        adjusted_brier <= raw_brier
+        and
+        adjusted_log <= raw_log
+    ):
+
+        print(
+            "RESULT: rolling-alpha probabilities "
+            "did not degrade either aggregate metric."
+        )
+
+    else:
+
+        print(
+            "RESULT: rolling-alpha probabilities "
+            "did NOT improve both aggregate metrics."
+        )
+
 
 # ============================================================
 # PRINT DAILY PATH
@@ -878,6 +1300,8 @@ def print_daily_decisions(
             f"{row['ticker']} | "
             f"edge "
             f"{row['net_edge']:+.2%} | "
+            f"exp ROI "
+            f"{row['expected_return_on_risk']:+.2%} | "
             f"P&L {pnl_text}"
         )
 
@@ -889,7 +1313,9 @@ def print_daily_decisions(
 def main():
 
     dataframe = (
-        load_dataset()
+        load_synchronized_market_history(
+            minimum_dates=50
+        )
     ).copy()
 
     dataframe[
@@ -953,6 +1379,11 @@ def main():
     )
 
     print(
+        f"Min expected ROI:   "
+        f"{MIN_EXPECTED_RETURN_ON_RISK:.2%}"
+    )
+
+    print(
         "Max trades/day:     1"
     )
 
@@ -961,36 +1392,12 @@ def main():
             decisions,
 
         label=
-            "FULL WALK-FORWARD PERIOD"
+            "30 MOST RECENT SYNCHRONIZED "
+            "WALK-FORWARD DATES"
     )
 
-    summarize_period(
-        decisions=
-            decisions,
-
-        label=
-            "AUG 19 - SEP 10",
-
-        start_date=
-            "2026-08-19",
-
-        end_date=
-            "2026-09-10"
-    )
-
-    summarize_period(
-        decisions=
-            decisions,
-
-        label=
-            "SEP 11 - SEP 26 "
-            "(PREVIOUS HOLDOUT; NOW RESEARCHED)",
-
-        start_date=
-            PREVIOUS_HOLDOUT_START,
-
-        end_date=
-            PREVIOUS_HOLDOUT_END
+    summarize_probability_quality(
+        decisions
     )
 
     print_daily_decisions(

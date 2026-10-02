@@ -1,5 +1,5 @@
 import argparse
-
+import os
 import numpy as np
 import pandas as pd
 
@@ -8,6 +8,7 @@ from src.backtest.v2_source_signal_test import (
 )
 
 from src.backtest.v2_market_only_control import (
+    ALPHA_VALUES,
     fit_market_alpha,
     market_only_probabilities
 )
@@ -32,10 +33,20 @@ from src.kalshi.fees import (
 from src.kalshi.live_executor import (
     execute_live_trade
 )
+from src.backtest.v2_market_only_history import (
+    load_synchronized_market_history
+)
 
 from src.kalshi.decision_timing import (
     MAX_QUOTE_DELAY_MINUTES,
-    validate_decision_quote_time
+    validate_decision_quote_time,
+    SYNC_CALIBRATION_PREFIX,
+    historical_calibration_age_limit,
+)
+
+from src.kalshi.historical_market import (
+    get_decision_time,
+    build_event_ticker,
 )
 
 
@@ -45,13 +56,8 @@ from src.kalshi.decision_timing import (
 
 LOOKBACK_DAYS = 20
 
-ALPHA_VALUES = np.arange(
-    0.50,
-    5.0001,
-    0.025
-)
-
 MINIMUM_EDGE = 0.025
+MIN_EXPECTED_RETURN_ON_RISK = 0.10
 
 DECISION_HOUR_UTC = 20
 DECISION_MINUTE_UTC = 5
@@ -59,123 +65,13 @@ DECISION_MINUTE_UTC = 5
 SAVE_WINDOW_MINUTES = 15
 
 def load_market_only_calibration_history():
-    history = get_historical_market_entries().copy()
-    for column in ("decision_time", "entry_time", "calibration_quote_time"):
-        history[column] = pd.to_datetime(
-            history[column], utc=True, errors="coerce",
+
+    return (
+        load_synchronized_market_history(
+            minimum_dates=LOOKBACK_DAYS
         )
-    history["target_date"] = pd.to_datetime(
-        history["target_date"], errors="coerce",
-    ).dt.strftime("%Y-%m-%d")
-    history = history[
-        (history["decision_time"].dt.hour == DECISION_HOUR_UTC)
-        & (history["decision_time"].dt.minute == DECISION_MINUTE_UTC)
-        & (history["decision_time"].dt.second == 0)
-        & (history["decision_time"].dt.microsecond == 0)
-    ].copy()
-
-    def build_snapshot(group, source):
-        decision = group["decision_time"].iloc[0]
-
-        if source == "calibration":
-            timestamps = group["calibration_quote_time"]
-            bid_column, ask_column = (
-                "calibration_yes_bid", "calibration_yes_ask"
-            )
-            asof = decision
-            if not timestamps.le(decision).all():
-                return None
-        else:
-            timestamps = group["entry_time"]
-            bid_column, ask_column = "yes_bid", "yes_ask"
-            if not (
-                timestamps.ge(decision)
-                & timestamps.le(decision + pd.Timedelta(minutes=2))
-            ).all():
-                return None
-
-            # Modeled snapshot time retains the later information time.
-            asof = timestamps.max()
-
-        ages = (asof - timestamps).dt.total_seconds() / 60
-        bid = pd.to_numeric(group[bid_column], errors="coerce")
-        ask = pd.to_numeric(group[ask_column], errors="coerce")
-        if not (
-            ages.between(0, 2)
-            & bid.between(0, 1)
-            & ask.between(0, 1)
-            & bid.le(ask)
-        ).all():
-            return None
-
-        mids = (bid + ask) / 2
-        if mids.sum() <= 0:
-            return None
-
-        snapshot = group.copy()
-        snapshot["market_probability"] = mids / mids.sum()
-        snapshot["quote_source"] = source
-        snapshot["quote_time_utc"] = timestamps
-        snapshot["calibration_asof_utc"] = asof
-        snapshot["quote_age_minutes"] = ages
-        return snapshot
-
-    rows = []
-    for target_date, group in history.groupby("target_date"):
-        group = group.copy()
-        if (
-            len(group) != 6
-            or group["ticker"].nunique() != 6
-            or group["decision_time"].nunique() != 1
-            or not group["market_status"].astype(str).str.lower()
-                .eq("finalized").all()
-        ):
-            continue
-
-        outcomes = (
-            group["result"].astype(str).str.strip().str.lower()
-            .map({"yes": 1.0, "no": 0.0})
-        )
-        settlement = pd.to_numeric(
-            group["settlement_value"], errors="coerce",
-        )
-        fallback = pd.Series(
-            np.where(
-                np.isclose(settlement, 1), 1.0,
-                np.where(np.isclose(settlement, 0), 0.0, np.nan),
-            ),
-            index=group.index,
-        )
-        outcomes = outcomes.fillna(fallback)
-        if outcomes.isna().any() or not np.isclose(outcomes.sum(), 1):
-            continue
-        group["outcome"] = outcomes
-
-        snapshot = build_snapshot(group, "calibration")
-        if snapshot is None:
-            snapshot = build_snapshot(group, "entry_window")
-        if snapshot is None:
-            continue
-
-        rows.extend(snapshot[[
-            "target_date", "ticker", "market_probability", "outcome",
-            "quote_source", "quote_time_utc", "calibration_asof_utc",
-            "quote_age_minutes",
-        ]].to_dict("records"))
-
-    dataframe = pd.DataFrame(rows, columns=[
-        "target_date", "ticker", "market_probability", "outcome",
-        "quote_source", "quote_time_utc", "calibration_asof_utc",
-        "quote_age_minutes",
-    ])
-    complete_dates = dataframe["target_date"].nunique()
-    if complete_dates < LOOKBACK_DAYS:
-        raise RuntimeError(
-            f"Only {complete_dates} complete settled calibration dates; "
-            f"{LOOKBACK_DAYS} are required."
-        )
-
-    return dataframe
+        .copy()
+    )
 # ============================================================
 # HISTORICAL CALIBRATION
 # ============================================================
@@ -200,7 +96,10 @@ def calculate_live_alpha(
                 all_dates,
 
             target_date=
-                target_date
+                target_date,
+
+            lookback_days=
+                LOOKBACK_DAYS
         )
     )
 
@@ -263,6 +162,12 @@ def calculate_live_alpha(
     )
 
     return {
+
+        "calculated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "quote_policy": "first_common_1550_1605_new_york",
+        "training_dates": [str(date) for date in training_dates],
+        "training_count": len(training_dates),
+        "training_rows": len(training_data),
 
         "alpha":
             float(
@@ -489,6 +394,20 @@ def build_trade_candidates(
             yes_fee
         )
 
+        yes_net_edge = (
+            adjusted_yes_probability
+            -
+            yes_cost
+        )
+
+        yes_expected_return_on_risk = (
+            yes_net_edge
+            /
+            yes_cost
+            if yes_cost > 0
+            else float("-inf")
+        )
+
         candidates.append({
 
             "ticker":
@@ -515,11 +434,10 @@ def build_trade_candidates(
                 yes_cost,
 
             "net_edge":
-                (
-                    adjusted_yes_probability
-                    -
-                    yes_cost
-                )
+                yes_net_edge,
+
+            "expected_return_on_risk":
+                yes_expected_return_on_risk
         })
 
         # ----------------------------------------------------
@@ -551,6 +469,20 @@ def build_trade_candidates(
             no_fee
         )
 
+        no_net_edge = (
+            adjusted_no_probability
+            -
+            no_cost
+        )
+
+        no_expected_return_on_risk = (
+            no_net_edge
+            /
+            no_cost
+            if no_cost > 0
+            else float("-inf")
+        )
+
         candidates.append({
 
             "ticker":
@@ -577,11 +509,10 @@ def build_trade_candidates(
                 no_cost,
 
             "net_edge":
-                (
-                    adjusted_no_probability
-                    -
-                    no_cost
-                )
+                no_net_edge,
+
+            "expected_return_on_risk":
+                no_expected_return_on_risk
         })
 
     candidates.sort(
@@ -759,19 +690,40 @@ def run_shadow_trader(
             "No trade candidates generated."
         )
 
-    best = (
-        candidates[
+    qualifying_candidates = [
+        candidate
+        for candidate in candidates
+        if (
+            candidate[
+                "net_edge"
+            ]
+            >=
+            MINIMUM_EDGE
+            and
+            candidate[
+                "expected_return_on_risk"
+            ]
+            >=
+            MIN_EXPECTED_RETURN_ON_RISK
+        )
+    ]
+
+
+    if qualifying_candidates:
+
+        best = qualifying_candidates[
             0
         ]
-    )
 
-    trade_taken = (
-        best[
-            "net_edge"
+        trade_taken = True
+
+    else:
+
+        best = candidates[
+            0
         ]
-        >=
-        MINIMUM_EDGE
-    )
+
+        trade_taken = False
 
     # --------------------------------------------------------
     # Display
@@ -883,7 +835,9 @@ def run_shadow_trader(
             f"Cost: "
             f"{candidate['total_cost']:.2%}  "
             f"Edge: "
-            f"{candidate['net_edge']:+.2%}"
+            f"{candidate['net_edge']:+.2%}  "
+            f"Exp ROI: "
+            f"{candidate['expected_return_on_risk']:+.2%}"
         )
 
     print()
@@ -932,6 +886,11 @@ def run_shadow_trader(
     print(
         f"Net edge:             "
         f"{best['net_edge']:+.2%}"
+    )
+
+    print(
+        f"Expected return/risk: "
+        f"{best['expected_return_on_risk']:+.2%}"
     )
 
     # --------------------------------------------------------
@@ -1007,6 +966,14 @@ def run_shadow_trader(
             best[
                 "net_edge"
             ],
+        
+        "expected_return_on_risk":
+            best[
+                "expected_return_on_risk"
+            ],
+
+        "minimum_expected_return_on_risk":
+            MIN_EXPECTED_RETURN_ON_RISK,
 
         "minimum_edge":
             MINIMUM_EDGE

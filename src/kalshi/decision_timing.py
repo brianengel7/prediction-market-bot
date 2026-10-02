@@ -78,3 +78,37 @@ def validate_decision_quote_time(
         )
 
     return quote_time
+
+SYNC_CALIBRATION_PREFIX = "SYNC_FIRST_1550_1605|"
+
+
+def historical_calibration_age_limit(
+    sources, timestamps, default_minutes=2
+):
+    sources = list(sources)
+    flags = [
+        str(source).startswith(SYNC_CALIBRATION_PREFIX)
+        for source in sources
+    ]
+
+    if not any(flags):
+        return default_minutes
+
+    times = pd.to_datetime(
+        list(timestamps), utc=True, errors="coerce"
+    )
+
+    if (
+        len(flags) != 6
+        or not all(flags)
+        or len(times) != 6
+        or times.isna().any()
+        or len(set(times)) != 1
+        or times[0] != times[0].floor("min")
+    ):
+        raise ValueError(
+            "Synchronized calibration requires "
+            "six quotes at one minute."
+        )
+
+    return 15
