@@ -1651,7 +1651,8 @@ def get_historical_market_entries(
             dataframe[
                 "decision_time"
             ],
-            utc=True
+            utc=True,
+            format="mixed"
         )
 
         dataframe[
@@ -1660,9 +1661,9 @@ def get_historical_market_entries(
             dataframe[
                 "entry_time"
             ],
-            utc=True
+            utc=True,
+            format="mixed"
         )
-
     return dataframe
 
 def save_v2_nbm_probabilities(
