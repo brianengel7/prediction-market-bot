@@ -3,10 +3,6 @@ import os
 import numpy as np
 import pandas as pd
 
-from src.backtest.v2_source_signal_test import (
-    load_dataset
-)
-
 from src.backtest.v2_market_only_control import (
     ALPHA_VALUES,
     fit_market_alpha,
@@ -42,11 +38,6 @@ from src.kalshi.decision_timing import (
     validate_decision_quote_time,
     SYNC_CALIBRATION_PREFIX,
     historical_calibration_age_limit,
-)
-
-from src.kalshi.historical_market import (
-    get_decision_time,
-    build_event_ticker,
 )
 
 
@@ -573,14 +564,18 @@ def inside_save_window():
 
 def run_shadow_trader(
     save=False,
-    live=False
+    live=False,
+    test_live_now=False
 ):
     if live and not save:
-
         raise RuntimeError(
             "--live requires --save. "
             "A real order cannot be submitted "
             "without saving the shadow decision."
+        )
+    if test_live_now and not (save and live):
+        raise RuntimeError(
+            "--test-live-now requires both --save and --live."
         )
 
     # --------------------------------------------------------
@@ -649,12 +644,17 @@ def run_shadow_trader(
         ]
     )
 
-    if save:
-
+    if save and not test_live_now:
         quote_time = (
             validate_decision_quote_time(
                 quote_time
             )
+        )
+    elif save and test_live_now:
+        print()
+        print(
+            "WARNING: timing validation bypassed "
+            "for controlled live pipeline test."
         )
 
     decision_time = (
@@ -996,11 +996,16 @@ def run_shadow_trader(
     # Enforce decision timing
     # --------------------------------------------------------
 
-    if not inside_save_window():
-
+    if not test_live_now and not inside_save_window():
         raise RuntimeError(
             "Outside the allowed "
             "20:05-20:20 UTC save window."
+        )
+    if test_live_now:
+        print()
+        print(
+            "WARNING: 20:05-20:20 UTC save window "
+            "bypassed for controlled live test."
         )
 
     save_v2_market_only_shadow_decision(
@@ -1025,8 +1030,7 @@ def run_shadow_trader(
         live_result = (
             execute_live_trade(
                 trade=decision,
-                strategy="MARKET_ONLY",
-                contracts=1
+                strategy="MARKET_ONLY_INITIAL"
             )
         )
 
@@ -1079,13 +1083,23 @@ def main():
         )
     )
 
+    parser.add_argument(
+        "--test-live-now",
+        action="store_true",
+        help=(
+            "TEMPORARY: bypass decision-time safeguards "
+            "for a controlled live pipeline test."
+        )
+    )
+
     args = (
         parser.parse_args()
     )
 
     run_shadow_trader(
         save=args.save,
-        live=args.live
+        live=args.live,
+        test_live_now=args.test_live_now
     )
 
 

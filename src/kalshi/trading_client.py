@@ -48,6 +48,7 @@ FILLS_PATH = (
 ORDERS_PATH = (
     "/portfolio/orders"
 )
+BALANCE_PATH = "/portfolio/balance"
 
 class OrderSubmissionUnknownError(
     RuntimeError
@@ -244,6 +245,77 @@ def build_auth_headers(
         "Content-Type":
             "application/json"
     }
+
+def get_cash_balance(
+    timeout=15
+):
+    """
+    Retrieve currently available Kalshi cash balance.
+
+    Returns:
+        Decimal dollars available for new trades.
+    """
+
+    base_url = os.getenv(
+        "KALSHI_BASE_URL",
+        DEFAULT_BASE_URL
+    )
+
+    url = (
+        base_url
+        +
+        BALANCE_PATH
+    )
+
+    response = requests.get(
+        url,
+        headers=build_auth_headers(
+            method="GET",
+            url=url
+        ),
+        timeout=timeout
+    )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            "Kalshi balance lookup failed.\n"
+            f"HTTP {response.status_code}\n"
+            f"{response.text}"
+        )
+
+    data = response.json()
+
+    balance_dollars = data.get(
+        "balance_dollars"
+    )
+
+    if balance_dollars in (
+        None,
+        ""
+    ):
+
+        raise RuntimeError(
+            "Kalshi balance response did not "
+            "contain balance_dollars."
+        )
+
+    balance = Decimal(
+        str(balance_dollars)
+    )
+
+    if (
+        not balance.is_finite()
+        or
+        balance < 0
+    ):
+
+        raise RuntimeError(
+            f"Invalid Kalshi cash balance: "
+            f"{balance_dollars}"
+        )
+
+    return balance
 
 
 # ============================================================

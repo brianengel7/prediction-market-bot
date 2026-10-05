@@ -17,14 +17,16 @@ from src.kalshi.trading_client import (
     get_order_fills,
     summarize_order_fills,
     find_order_by_client_order_id,
+    get_cash_balance,
     OrderSubmissionUnknownError
+)
+from src.kalshi.fees import (
+    calculate_taker_fee
 )
 
 
 MAX_ORDER_LIFETIME_MINUTES = 30
 MINIMUM_NET_EDGE = 0.025
-MAX_CONTRACTS = 1
-MAX_LIVE_CONTRACTS_PER_TARGET_DATE = 1
 MAX_DECISION_AGE_MINUTES = 15
 MINIMUM_EXPECTED_RETURN_ON_RISK = 0.10
 
@@ -51,21 +53,39 @@ def live_trading_enabled():
 def build_client_order_id(
     strategy,
     target_date,
+    decision_time,
     ticker,
     side
 ):
-    """
-    Deterministic order ID.
+    decision_timestamp = pd.Timestamp(
+        decision_time
+    )
 
-    If the same strategy/date/ticker/side is accidentally
-    submitted twice, Kalshi sees the same client_order_id
-    instead of creating a second independent order.
-    """
+    if decision_timestamp.tzinfo is None:
+
+        decision_timestamp = (
+            decision_timestamp.tz_localize(
+                "UTC"
+            )
+        )
+
+    else:
+
+        decision_timestamp = (
+            decision_timestamp.tz_convert(
+                "UTC"
+            )
+        )
+
+    decision_key = (
+        decision_timestamp.isoformat()
+    )
 
     key = (
         f"prediction-market-bot:"
         f"{strategy}:"
         f"{target_date}:"
+        f"{decision_key}:"
         f"{ticker}:"
         f"{side}"
     )
@@ -264,24 +284,29 @@ def validate_live_trade(
             f"invalid side {side}."
         )
 
-    contracts = float(
-        contracts
-    )
+    contracts = float(contracts)
 
-    if contracts <= 0:
+    if (
+        not math.isfinite(contracts)
+        or
+        contracts <= 0
+    ):
 
         raise RuntimeError(
             "Live trade rejected: "
-            "contracts must be positive."
+            "contracts must be positive and finite."
         )
 
-    if contracts > MAX_CONTRACTS:
+    if not contracts.is_integer():
 
         raise RuntimeError(
-            f"Live trade rejected: "
-            f"{contracts} contracts exceeds "
-            f"maximum of {MAX_CONTRACTS}."
+            "Live trade rejected: "
+            "contracts must be a whole number."
         )
+
+    contracts = int(
+        contracts
+    )
 
     entry_price = float(
         trade[
@@ -842,214 +867,357 @@ def recover_unknown_submission(
 
     return recovered_result
 
-def enforce_global_pilot_risk_cap(
-    target_date,
-    requested_contracts
-):
-    """
-    Prevent total live exposure for one target date
-    from exceeding the pilot risk limit.
+def get_position_sizing_settings():
 
-    Definitively UNFILLED or ERROR orders consume
-    no exposure.
-
-    Ambiguous/in-flight orders reserve their full
-    requested contract count.
-    """
-
-    orders = get_live_orders()
-
-    if orders.empty:
-        return
-
-    same_date = orders[
-        orders["target_date"].astype(str)
-        ==
-        str(target_date)
-    ]
-
-    if same_date.empty:
-        return
-
-    reserved_contracts = 0.0
-
-    for _, order in same_date.iterrows():
-
-        status = (
-            str(
-                order.get(
-                    "order_status",
-                    ""
-                )
-            )
-            .strip()
-            .upper()
-        )
-
-        remaining_count = order.get("remaining_count")
-        pending_remainder = (
-            not pd.isna(remaining_count)
-            and float(remaining_count) > 0
-        )
-
-        # An older UNFILLED row may still have pending contracts.
-        if status == "ERROR" or (
-            status == "UNFILLED" and not pending_remainder
-        ):
-            continue
-
-        fill_count = order.get(
-            "fill_count"
-        )
-
-        if pending_remainder:
-            existing_contracts = order.get("contracts")
-            reserved_contracts += max(
-                float(fill_count) if not pd.isna(fill_count) else 0.0,
-                float(existing_contracts)
-                if not pd.isna(existing_contracts)
-                else MAX_CONTRACTS,
-            )
-            continue
-
-        # Known fills count as actual exposure.
-        if (
-            not pd.isna(
-                fill_count
-            )
-            and
-            float(fill_count) > 0
-        ):
-
-            reserved_contracts += float(
-                fill_count
-            )
-
-            continue
-
-        # Anything else may still represent exposure:
-        # SUBMITTING, SUBMISSION_UNKNOWN,
-        # unreconciled orders, recovered orders, etc.
-        existing_contracts = order.get(
-            "contracts"
-        )
-
-        if pd.isna(
-            existing_contracts
-        ):
-
-            existing_contracts = (
-                MAX_CONTRACTS
-            )
-
-        reserved_contracts += float(
-            existing_contracts
-        )
-
-    projected_contracts = (
-        reserved_contracts
-        +
-        float(
-            requested_contracts
+    position_pct = Decimal(
+        os.getenv(
+            "KALSHI_POSITION_SIZE_PCT",
+            "0.10"
         )
     )
 
-    if (
-        projected_contracts
-        >
-        MAX_LIVE_CONTRACTS_PER_TARGET_DATE
+    minimum_trade = Decimal(
+        os.getenv(
+            "KALSHI_MIN_TRADE_DOLLARS",
+            "10.00"
+        )
+    )
+
+    maximum_trade = Decimal(
+        os.getenv(
+            "KALSHI_MAX_TRADE_DOLLARS",
+            "100.00"
+        )
+    )
+
+    for name, value in (
+        (
+            "KALSHI_POSITION_SIZE_PCT",
+            position_pct
+        ),
+        (
+            "KALSHI_MIN_TRADE_DOLLARS",
+            minimum_trade
+        ),
+        (
+            "KALSHI_MAX_TRADE_DOLLARS",
+            maximum_trade
+        ),
     ):
 
+        if (
+            not value.is_finite()
+            or
+            value <= 0
+        ):
+
+            raise RuntimeError(
+                f"{name} must be "
+                f"positive and finite."
+            )
+
+    if position_pct > Decimal("1"):
+
         raise RuntimeError(
-            "LIVE TRADE BLOCKED BY GLOBAL "
-            "PILOT RISK CAP.\n"
-            f"Target date: {target_date}\n"
-            f"Existing/reserved contracts: "
-            f"{reserved_contracts:g}\n"
-            f"Requested contracts: "
-            f"{float(requested_contracts):g}\n"
-            f"Maximum allowed: "
-            f"{MAX_LIVE_CONTRACTS_PER_TARGET_DATE}"
+            "KALSHI_POSITION_SIZE_PCT "
+            "cannot exceed 1.0."
         )
 
+    if maximum_trade < minimum_trade:
 
-def enforce_trade_budget(validated):
-    budget = Decimal(
-        os.getenv("KALSHI_MAX_TRADE_DOLLARS", "1.00")
+        raise RuntimeError(
+            "KALSHI_MAX_TRADE_DOLLARS "
+            "cannot be less than "
+            "KALSHI_MIN_TRADE_DOLLARS."
+        )
+
+    return {
+        "position_pct":
+            position_pct,
+
+        "minimum_trade":
+            minimum_trade,
+
+        "maximum_trade":
+            maximum_trade
+    }
+
+
+def get_live_fee_multiplier(
+    ticker
+):
+
+    series_ticker, event_date, _ = (
+        str(ticker).split("-", 2)
     )
-    if not budget.is_finite() or budget <= 0:
-        raise RuntimeError(
-            "KALSHI_MAX_TRADE_DOLLARS must be positive and finite."
-        )
 
-    if Decimal(str(validated["contracts"])) != Decimal("1"):
-        raise RuntimeError(
-            "This dollar-cap check supports the one-contract pilot."
-        )
+    series_info = get_series(
+        series_ticker
+    )
 
-    series_ticker, event_date, _ = str(
-        validated["ticker"]
-    ).split("-", 2)
-
-    series_info = get_series(series_ticker)
-    event_info = get_event(f"{series_ticker}-{event_date}")
+    event_info = get_event(
+        f"{series_ticker}-{event_date}"
+    )
 
     fee_type = (
-        event_info.get("fee_type_override")
-        or series_info.get("fee_type")
+        event_info.get(
+            "fee_type_override"
+        )
+        or
+        series_info.get(
+            "fee_type"
+        )
     )
-    override = event_info.get("fee_multiplier_override")
-    multiplier = Decimal(str(
-        override
-        if override is not None
-        else series_info.get("fee_multiplier")
-    ))
+
+    override = event_info.get(
+        "fee_multiplier_override"
+    )
+
+    multiplier = Decimal(
+        str(
+            override
+            if override is not None
+            else series_info.get(
+                "fee_multiplier"
+            )
+        )
+    )
 
     if (
         fee_type != "quadratic"
-        or not multiplier.is_finite()
-        or not Decimal("0") <= multiplier <= Decimal("1")
+        or
+        not multiplier.is_finite()
+        or
+        not Decimal("0")
+        <= multiplier
+        <= Decimal("1")
     ):
+
         raise RuntimeError(
-            "Live trade blocked: fee schedule needs review."
+            "Live trade blocked: "
+            "fee schedule needs review."
         )
 
-    price_limit = Decimal(
-        str(validated["entry_price"])
-    ).quantize(
-        Decimal("0.0001"), rounding=ROUND_CEILING
-    )
+    return multiplier
 
-    # Conservative allowance for fees and rounding.
-    reserved_cost = (
-        price_limit + Decimal("0.03")
-    ).quantize(
-        Decimal("0.01"), rounding=ROUND_CEILING
-    )
 
-    if reserved_cost > budget:
-        raise RuntimeError(
-            f"Live trade blocked: reserved cost ${reserved_cost:.2f} "
-            f"exceeds trade cap ${budget:.2f}."
+def calculate_position_size(
+    trade
+):
+    """
+    Size a new order from currently available cash.
+
+    Rule:
+        desired budget =
+            max(
+                minimum trade dollars,
+                cash balance * position percentage
+            )
+
+        effective budget =
+            min(
+                desired budget,
+                available cash,
+                absolute trade cap
+            )
+
+    Then buy the largest whole number of
+    contracts whose principal + fees fits
+    inside that budget.
+    """
+
+    cash_balance = Decimal(
+        str(
+            get_cash_balance()
         )
+    )
+
+    if (
+        not cash_balance.is_finite()
+        or
+        cash_balance <= 0
+    ):
+
+        raise RuntimeError(
+            "Live trade blocked: "
+            f"invalid cash balance "
+            f"${cash_balance}."
+        )
+
+    settings = (
+        get_position_sizing_settings()
+    )
+
+    percentage_budget = (
+        cash_balance
+        *
+        settings["position_pct"]
+    )
+
+    desired_budget = max(
+        percentage_budget,
+        settings["minimum_trade"]
+    )
+
+    trade_budget = min(
+        desired_budget,
+        cash_balance,
+        settings["maximum_trade"]
+    )
+
+    entry_price = Decimal(
+        str(
+            trade["entry_price"]
+        )
+    ).quantize(
+        Decimal("0.0001"),
+        rounding=ROUND_CEILING
+    )
+
+    if (
+        entry_price <= 0
+        or
+        entry_price >= 1
+    ):
+
+        raise RuntimeError(
+            "Live trade blocked: "
+            f"invalid entry price "
+            f"{entry_price}."
+        )
+
+    multiplier = (
+        get_live_fee_multiplier(
+            trade["ticker"]
+        )
+    )
+
+    rough_max_contracts = int(
+        trade_budget
+        /
+        entry_price
+    )
+
+    best_contracts = 0
+    best_fee = Decimal("0")
+    best_total_cost = Decimal("0")
+
+    for contracts in range(
+        1,
+        rough_max_contracts + 1
+    ):
+
+        fee = Decimal(
+            str(
+                calculate_taker_fee(
+                    price=float(
+                        entry_price
+                    ),
+                    contracts=contracts,
+                    multiplier=float(
+                        multiplier
+                    )
+                )
+            )
+        )
+
+        total_cost = (
+            entry_price
+            *
+            Decimal(contracts)
+            +
+            fee
+        )
+
+        if total_cost <= trade_budget:
+
+            best_contracts = contracts
+            best_fee = fee
+            best_total_cost = total_cost
+
+        else:
+
+            break
+
+    if best_contracts <= 0:
+
+        raise RuntimeError(
+            "Live trade blocked: "
+            "no whole contract fits "
+            "inside the calculated "
+            f"${trade_budget:.2f} budget."
+        )
+
+    print()
+    print("=" * 72)
+    print("LIVE POSITION SIZING")
+    print("=" * 72)
 
     print(
-        f"Trade cap: ${budget:.2f}; "
-        f"reserved cost: ${reserved_cost:.2f}"
+        f"Available cash:    "
+        f"${cash_balance:.2f}"
     )
+
+    print(
+        f"Position percent:  "
+        f"{settings['position_pct']:.2%}"
+    )
+
+    print(
+        f"Minimum trade:     "
+        f"${settings['minimum_trade']:.2f}"
+    )
+
+    print(
+        f"Maximum trade:     "
+        f"${settings['maximum_trade']:.2f}"
+    )
+
+    print(
+        f"Trade budget:      "
+        f"${trade_budget:.2f}"
+    )
+
+    print(
+        f"Contracts:         "
+        f"{best_contracts}"
+    )
+
+    print(
+        f"Estimated fees:    "
+        f"${best_fee:.2f}"
+    )
+
+    print(
+        f"Reserved cost:     "
+        f"${best_total_cost:.2f}"
+    )
+
+    return {
+        "cash_balance":
+            cash_balance,
+
+        "trade_budget":
+            trade_budget,
+
+        "contracts":
+            best_contracts,
+
+        "estimated_fee":
+            best_fee,
+
+        "reserved_cost":
+            best_total_cost,
+
+        "fee_multiplier":
+            multiplier
+    }
 
 def execute_live_trade(
     trade,
     strategy,
-    contracts=1
+    contracts=None
 ):
-    """
-    Submit a REAL Kalshi order.
-
-    Requires:
-        1. --live from the strategy runner
-        2. KALSHI_LIVE_TRADING_ENABLED=true
-    """
 
     # --------------------------------------------------------
     # 1. Global live-money lock
@@ -1067,11 +1235,50 @@ def execute_live_trade(
     # 2. Validate strategy decision
     # --------------------------------------------------------
 
+    # First validate the strategy signal itself.
+    validated = validate_live_trade(
+        trade=trade,
+        contracts=1
+    )
+
+    # Calculate the maximum permitted position
+    # from current available cash.
+    sizing = calculate_position_size(
+        validated
+    )
+
+    if contracts is None:
+
+        contracts = sizing[
+            "contracts"
+        ]
+
+    else:
+
+        contracts = int(
+            contracts
+        )
+
+        if (
+            contracts
+            >
+            sizing["contracts"]
+        ):
+
+            raise RuntimeError(
+                "Live trade blocked: "
+                f"requested {contracts} contracts "
+                f"but cash-based sizing allows "
+                f"at most "
+                f"{sizing['contracts']}."
+            )
+
+    # Revalidate with the actual quantity
+    # that will be submitted.
     validated = validate_live_trade(
         trade=trade,
         contracts=contracts
     )
-    enforce_trade_budget(validated)
 
     # --------------------------------------------------------
     # 3. Deterministic order ID
@@ -1083,6 +1290,9 @@ def execute_live_trade(
 
             target_date=
                 validated["target_date"],
+
+            decision_time=
+                validated["decision_time"],
 
             ticker=
                 validated["ticker"],
@@ -1098,18 +1308,6 @@ def execute_live_trade(
 
     ensure_not_already_submitted(
         client_order_id
-    )
-
-    enforce_global_pilot_risk_cap(
-        target_date=
-            validated[
-                "target_date"
-            ],
-
-        requested_contracts=
-            validated[
-                "contracts"
-            ]
     )
 
     print()
