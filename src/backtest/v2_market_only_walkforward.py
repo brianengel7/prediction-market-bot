@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import argparse
 
 from src.backtest.v2_market_only_history import (
     load_synchronized_market_history
@@ -1312,11 +1313,60 @@ def print_daily_decisions(
 
 def main():
 
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--series-ticker",
+        default="KXHIGHNY",
+        help=(
+            "Kalshi weather series to backtest. "
+            "Defaults to KXHIGHNY."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    series_ticker = (
+        str(args.series_ticker)
+        .strip()
+        .upper()
+    )
+
+    if not series_ticker:
+
+        parser.error(
+            "--series-ticker cannot be empty."
+        )
+
     dataframe = (
         load_synchronized_market_history(
-            minimum_dates=50
+            minimum_dates=50,
+            series_ticker=
+                series_ticker,
         )
     ).copy()
+
+    # Fail fast if the loader ever mixes cities.
+    if not dataframe[
+        "ticker"
+    ].astype(str).str.startswith(
+        series_ticker + "-"
+    ).all():
+
+        raise RuntimeError(
+            f"History contains contracts "
+            f"outside {series_ticker}."
+        )
+
+    print(
+        f"Series:             "
+        f"{series_ticker}"
+    )
+
+    print(
+        f"Synchronized dates: "
+        f"{dataframe['target_date'].nunique()}"
+    )
 
     dataframe[
         "target_date"
@@ -1359,7 +1409,8 @@ def main():
     print()
     print("=" * 90)
     print(
-        "MARKET-ONLY WALK-FORWARD STRATEGY"
+        f"MARKET-ONLY WALK-FORWARD STRATEGY "
+        f"[{series_ticker}]"
     )
     print("=" * 90)
 

@@ -18,7 +18,8 @@ from src.kalshi.historical_market import (
 
 
 def load_synchronized_market_history(
-    minimum_dates=20
+    minimum_dates=20,
+    series_ticker="KXHIGHNY",
 ):
 
     if not os.environ.get(
@@ -31,8 +32,17 @@ def load_synchronized_market_history(
             "Configure the Supabase connection first."
         )
 
+    series_ticker = (
+        str(series_ticker)
+        .strip()
+        .upper()
+    )
+
     history = (
-        get_historical_market_entries()
+        get_historical_market_entries(
+            series_ticker=
+                series_ticker,
+        )
         .copy()
     )
 
@@ -130,10 +140,16 @@ def load_synchronized_market_history(
             )
         )
 
-        expected_event = (
+        event_ticker = (
             build_event_ticker(
-                target_date
+                target_date,
+                series_ticker=
+                    series_ticker,
             )
+        )
+
+        expected_event = (
+            event_ticker
             +
             "-"
         )
@@ -172,6 +188,12 @@ def load_synchronized_market_history(
             ].astype(str)
             .str.startswith(
                 SYNC_CALIBRATION_PREFIX
+            ).all()
+            or
+            not group[
+                "event_ticker"
+            ].astype(str).eq(
+                event_ticker
             ).all()
         ):
 

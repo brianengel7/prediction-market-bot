@@ -4,40 +4,130 @@ from pathlib import Path
 import pandas as pd
 
 from src.kalshi.historical_market import (
+    build_event_ticker,
     get_event_markets,
     load_market_candles,
     parse_candle,
+    get_decision_time
 )
 from src.backtest.hourly_request_limits import hourly_backfill_requests
 
+from src.database.db import (
+    get_connection,
+    ensure_market_calibration_schema,
+    save_historical_market_entries,
+    get_historical_market_entries,
+)
 
-def collect_date(target_date):
-    day = pd.Timestamp(target_date) - pd.Timedelta(days=1)
+from src.kalshi.decision_timing import SYNC_CALIBRATION_PREFIX
+
+
+def collect_date(
+    target_date,
+    series_ticker="KXHIGHNY",
+):
+    day = (
+        pd.Timestamp(target_date)
+        -
+        pd.Timedelta(days=1)
+    )
 
     decision = (
-        day + pd.Timedelta(hours=16, minutes=5)
-    ).tz_localize("America/New_York").tz_convert("UTC")
+        day
+        +
+        pd.Timedelta(
+            hours=16,
+            minutes=5,
+        )
+    ).tz_localize(
+        "America/New_York"
+    ).tz_convert(
+        "UTC"
+    )
 
-    start = decision - pd.Timedelta(minutes=15)
+    start = (
+        decision
+        -
+        pd.Timedelta(
+            minutes=15
+        )
+    )
 
-    event = get_event_markets(target_date)
-    markets = sorted(event["markets"], key=lambda m: m["ticker"])
+    # --------------------------------------------------------
+    # Load the requested city's event.
+    # --------------------------------------------------------
 
-    if len(markets) != 6 or len({m["ticker"] for m in markets}) != 6:
-        raise ValueError("Expected six unique contracts.")
+    event = get_event_markets(
+        target_date,
+        series_ticker=
+            series_ticker,
+    )
+
+    expected_event = (
+        build_event_ticker(
+            target_date,
+            series_ticker=
+                series_ticker,
+        )
+    )
+
+    if (
+        event["event_ticker"]
+        !=
+        expected_event
+    ):
+
+        raise RuntimeError(
+            "Wrong event returned.\n"
+            f"Requested: {expected_event}\n"
+            f"Received:  "
+            f"{event['event_ticker']}"
+        )
+
+    # IMPORTANT:
+    # markets must be assigned before any checks use it.
+
+    markets = sorted(
+        event["markets"],
+        key=lambda market:
+            market["ticker"],
+    )
+
+    if (
+        len(markets) != 6
+        or
+        len({
+            market["ticker"]
+            for market in markets
+        }) != 6
+    ):
+
+        raise ValueError(
+            f"Expected six unique contracts "
+            f"for {expected_event}; "
+            f"found {len(markets)}."
+        )
 
     if not all(
-        m["ticker"].startswith(event["event_ticker"] + "-")
-        for m in markets
+        str(
+            market["ticker"]
+        ).startswith(
+            expected_event + "-"
+        )
+        for market in markets
     ):
-        raise ValueError("Contracts do not belong to the same event.")
+
+        raise RuntimeError(
+            f"One or more contracts do not "
+            f"belong to {expected_event}."
+        )
 
     by_ticker = {}
     sources = {}
 
     for market in markets:
         ticker = market["ticker"]
-        data = load_market_candles(ticker, start, decision)
+        data = load_market_candles(ticker, start, decision, series_ticker=series_ticker)
 
         quotes = {}
         conflicts = set()
@@ -133,6 +223,15 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+        "--series-ticker",
+        default="KXHIGHNY",
+        help=(
+            "Kalshi daily-high series ticker. "
+            "Defaults to KXHIGHNY."
+        ),
+    )
+
+    parser.add_argument(
         "--start-date",
         required=True,
         help="First target date to collect (YYYY-MM-DD).",
@@ -153,6 +252,18 @@ def main():
     )
 
     args = parser.parse_args()
+
+    series_ticker = (
+        str(args.series_ticker)
+        .strip()
+        .upper()
+    )
+
+    if not series_ticker:
+
+        parser.error(
+            "--series-ticker cannot be empty."
+        )
 
 
     start = pd.Timestamp(
@@ -202,21 +313,97 @@ def main():
             "PREDICTION_DATABASE_URL is missing; Supabase is required."
         )
 
-    from src.database.db import (
-        get_connection,
-        ensure_market_calibration_schema,
-        save_historical_market_entries,
-    )
-    from src.kalshi.decision_timing import SYNC_CALIBRATION_PREFIX
-    from src.kalshi.historical_market import (
-        get_decision_time,
-        build_event_ticker,
-    )
-
     with get_connection() as connection:
         ensure_market_calibration_schema(connection)
 
     policy = "first_common_1550_1605_new_york"
+    existing_history = (
+        get_historical_market_entries(
+            series_ticker=series_ticker,
+        )
+        .copy()
+    )
+
+    existing_dates = set()
+
+    if not existing_history.empty:
+
+        existing_history[
+            "target_date"
+        ] = pd.to_datetime(
+            existing_history[
+                "target_date"
+            ],
+            errors="coerce",
+        ).dt.strftime(
+            "%Y-%m-%d"
+        )
+
+        existing_history = (
+            existing_history[
+                existing_history[
+                    "calibration_candle_source"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.startswith(
+                    SYNC_CALIBRATION_PREFIX
+                )
+            ]
+            .copy()
+        )
+
+        for (
+            target,
+            group,
+        ) in existing_history.groupby(
+            "target_date"
+        ):
+
+            expected_event = (
+                build_event_ticker(
+                    target,
+                    series_ticker=
+                        series_ticker,
+                )
+            )
+
+            if (
+                len(group) == 6
+                and
+                group[
+                    "ticker"
+                ].nunique() == 6
+                and
+                group[
+                    "event_ticker"
+                ].astype(str).eq(
+                    expected_event
+                ).all()
+                and
+                group[
+                    "ticker"
+                ].astype(str)
+                .str.startswith(
+                    expected_event + "-"
+                ).all()
+            ):
+
+                existing_dates.add(
+                    target
+                )
+
+    print(
+        f"Series: {series_ticker}",
+        flush=True,
+    )
+
+    print(
+        f"Already stored: "
+        f"{len(existing_dates)} "
+        f"complete synchronized dates.",
+        flush=True,
+    )
 
     if SYNC_CALIBRATION_PREFIX != "SYNC_FIRST_1550_1605|":
         raise RuntimeError(
@@ -234,7 +421,7 @@ def main():
 
             entry = dict(row)
             target = pd.Timestamp(row["target_date"]).strftime("%Y-%m-%d")
-            expected_event = build_event_ticker(target)
+            expected_event = build_event_ticker(target, series_ticker=series_ticker)
 
             if (
                 row["event_ticker"] != expected_event
@@ -300,6 +487,20 @@ def main():
             cached = pd.DataFrame()
 
         if not cached.empty:
+            if "event_ticker" in cached.columns:
+                cached = (
+                    cached[
+                        cached[
+                            "event_ticker"
+                        ]
+                        .astype(str)
+                        .str.startswith(
+                            series_ticker + "-"
+                        )
+                    ]
+                    .copy()
+                )
+
             cached["target_date"] = pd.to_datetime(
                 cached["target_date"],
                 errors="raise",
@@ -350,13 +551,28 @@ def main():
         for date in pd.date_range(collection_start, end):
             target = date.strftime("%Y-%m-%d")
 
-            if target in imported:
+            if (
+                target in imported
+                or
+                target in existing_dates
+            ):
+
+                print(
+                    f"{target}: "
+                    f"ALREADY STORED "
+                    f"for {series_ticker}",
+                    flush=True,
+                )
+
                 continue
 
             print(f"Collecting {target}...", flush=True)
 
             try:
-                daily, status = collect_date(target)
+                daily, status = collect_date(
+                    target,
+                    series_ticker=series_ticker,
+                )
             except Exception as error:
                 failed += 1
                 print(
@@ -389,12 +605,20 @@ def main():
 
     with get_connection() as connection:
         stored_rows, stored_dates = connection.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT target_date) "
+            "SELECT COUNT(*), "
+            "COUNT(DISTINCT target_date) "
             "FROM historical_market_entries "
-            "WHERE calibration_candle_source IN (?, ?)",
+            "WHERE calibration_candle_source "
+            "IN (?, ?) "
+            "AND event_ticker LIKE ?",
             (
-                SYNC_CALIBRATION_PREFIX + "LIVE",
-                SYNC_CALIBRATION_PREFIX + "HISTORICAL",
+                SYNC_CALIBRATION_PREFIX
+                + "LIVE",
+
+                SYNC_CALIBRATION_PREFIX
+                + "HISTORICAL",
+
+                f"{series_ticker}-%",
             ),
         ).fetchone()
 
@@ -406,7 +630,9 @@ def main():
     )
 
     print(
-        f"Supabase read-back: {stored_rows} synchronized rows "
+        f"Supabase read-back "
+        f"[{series_ticker}]: "
+        f"{stored_rows} synchronized rows "
         f"across {stored_dates} dates."
     )
 

@@ -22,11 +22,17 @@ SEARCH_MINUTES = 45
 # ============================================================
 
 def build_event_ticker(
-    target_date
+    target_date,
+    series_ticker=SERIES_TICKER,
 ):
-
     target_date = pd.Timestamp(
         target_date
+    )
+
+    series_ticker = (
+        str(series_ticker)
+        .strip()
+        .upper()
     )
 
     date_code = (
@@ -36,7 +42,7 @@ def build_event_ticker(
     )
 
     return (
-        f"{SERIES_TICKER}-"
+        f"{series_ticker}-"
         f"{date_code}"
     )
 
@@ -92,19 +98,25 @@ def get_decision_time(
 # ============================================================
 
 def get_event_markets(
-    target_date
+    target_date,
+    series_ticker=SERIES_TICKER,
 ):
+    series_ticker = (
+        str(series_ticker)
+        .strip()
+        .upper()
+    )
 
     event_ticker = (
         build_event_ticker(
-            target_date
+            target_date,
+            series_ticker=
+                series_ticker,
         )
     )
 
     # --------------------------------------------------------
-    # First try normal event endpoint.
-    #
-    # Recent finalized markets may still be available here.
+    # First try the normal/live event endpoint.
     # --------------------------------------------------------
 
     event_data = (
@@ -114,15 +126,18 @@ def get_event_markets(
     )
 
     markets = (
-        event_data[
-            "markets"
-        ]
+        event_data.get(
+            "markets",
+            []
+        )
+        if event_data
+        else []
     )
 
     source = "LIVE"
 
     # --------------------------------------------------------
-    # Older markets eventually move into historical storage.
+    # Older finalized markets may have moved to historical.
     # --------------------------------------------------------
 
     if not markets:
@@ -135,20 +150,54 @@ def get_event_markets(
         )
 
         markets = (
-            historical[
-                "markets"
-            ]
+            historical.get(
+                "markets",
+                []
+            )
+            if historical
+            else []
         )
 
-        source = (
-            "HISTORICAL"
-        )
+        source = "HISTORICAL"
 
     if not markets:
 
         raise RuntimeError(
             f"No Kalshi markets found "
             f"for {event_ticker}."
+        )
+
+    # --------------------------------------------------------
+    # Fail fast if Kalshi returned the wrong series/event.
+    # --------------------------------------------------------
+
+    expected_prefix = (
+        event_ticker
+        +
+        "-"
+    )
+
+    wrong_tickers = [
+        market.get(
+            "ticker"
+        )
+        for market in markets
+        if not str(
+            market.get(
+                "ticker",
+                ""
+            )
+        ).startswith(
+            expected_prefix
+        )
+    ]
+
+    if wrong_tickers:
+
+        raise RuntimeError(
+            f"Wrong contracts returned for "
+            f"{event_ticker}: "
+            f"{wrong_tickers}"
         )
 
     return {
@@ -159,7 +208,7 @@ def get_event_markets(
             source,
 
         "markets":
-            markets
+            markets,
     }
 
 
@@ -215,17 +264,64 @@ def parse_candle(candle):
     }
 
 
-def load_market_candles(ticker, start_time, end_time):
-    start_ts = int(start_time.timestamp())
-    end_ts = int(end_time.timestamp())
+def load_market_candles(
+    ticker,
+    start_time,
+    end_time,
+    series_ticker=None,
+):
+    if series_ticker is None:
+
+        series_ticker = (
+            str(ticker)
+            .split("-", 1)[0]
+            .strip()
+            .upper()
+        )
+
+    series_ticker = (
+        str(series_ticker)
+        .strip()
+        .upper()
+    )
+
+    if not str(ticker).startswith(
+        series_ticker + "-"
+    ):
+
+        raise ValueError(
+            f"Ticker {ticker} does not belong "
+            f"to series {series_ticker}."
+        )
+
+    start_ts = int(
+        start_time.timestamp()
+    )
+
+    end_ts = int(
+        end_time.timestamp()
+    )
 
     endpoints = (
-        ("LIVE", get_market_candlesticks, {"series_ticker": SERIES_TICKER}),
-        ("HISTORICAL", get_historical_market_candlesticks, {}),
+        (
+            "LIVE",
+            get_market_candlesticks,
+            {
+                "series_ticker":
+                    series_ticker
+            },
+        ),
+        (
+            "HISTORICAL",
+            get_historical_market_candlesticks,
+            {},
+        ),
     )
 
     for source, fetch, extra in endpoints:
+
         try:
+
             candles = fetch(
                 ticker=ticker,
                 start_ts=start_ts,
@@ -233,24 +329,40 @@ def load_market_candles(ticker, start_time, end_time):
                 period_interval=1,
                 **extra,
             )
+
         except requests.HTTPError as error:
+
             if (
                 error.response is None
-                or error.response.status_code not in (404, 410)
+                or
+                error.response.status_code
+                not in (404, 410)
             ):
+
                 raise
+
             continue
 
         if candles:
+
             return {
-                "source": source,
-                "candles": sorted(
-                    candles,
-                    key=lambda candle: candle["end_period_ts"],
-                ),
+                "source":
+                    source,
+
+                "candles":
+                    sorted(
+                        candles,
+                        key=lambda candle:
+                            candle[
+                                "end_period_ts"
+                            ],
+                    ),
             }
 
-    return {"source": None, "candles": []}
+    return {
+        "source": None,
+        "candles": [],
+    }
 
 # ============================================================
 # FIND EXECUTABLE ENTRY QUOTE

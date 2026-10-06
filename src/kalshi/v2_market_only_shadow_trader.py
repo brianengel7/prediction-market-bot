@@ -1,5 +1,4 @@
 import argparse
-import os
 import numpy as np
 import pandas as pd
 
@@ -13,10 +12,7 @@ from src.backtest.v2_market_only_walkforward import (
     get_training_dates
 )
 
-from src.database.db import (
-    get_historical_market_entries,
-    save_v2_market_only_shadow_decision
-)
+from src.database.db import save_v2_market_only_shadow_decision
 
 from src.kalshi.market_logger import (
     get_current_weather_event
@@ -33,12 +29,7 @@ from src.backtest.v2_market_only_history import (
     load_synchronized_market_history
 )
 
-from src.kalshi.decision_timing import (
-    MAX_QUOTE_DELAY_MINUTES,
-    validate_decision_quote_time,
-    SYNC_CALIBRATION_PREFIX,
-    historical_calibration_age_limit,
-)
+from src.kalshi.decision_timing import validate_decision_quote_time
 
 
 # ============================================================

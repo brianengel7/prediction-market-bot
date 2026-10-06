@@ -1577,7 +1577,8 @@ def save_historical_market_entries(
 def get_historical_market_entries(
     start_date=None,
     end_date=None,
-    target_date=None
+    target_date=None,
+    series_ticker=None,
 ):
 
     query = """
@@ -1588,6 +1589,21 @@ def get_historical_market_entries(
 
     conditions = []
     params = []
+
+    if series_ticker is not None:
+        series_ticker = (
+            str(series_ticker)
+            .strip()
+            .upper()
+        )
+
+        conditions.append(
+            "event_ticker LIKE ?"
+        )
+
+        params.append(
+            f"{series_ticker}-%"
+        )
 
     if target_date is not None:
 
