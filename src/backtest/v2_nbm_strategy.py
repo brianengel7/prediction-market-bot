@@ -10,7 +10,6 @@ from src.kalshi.fees import (
     calculate_taker_fee
 )
 
-
 # ============================================================
 # CONFIG
 # ============================================================
@@ -40,7 +39,9 @@ EDGE_THRESHOLDS = [
 # ============================================================
 
 def build_daily_candidates(
-    group
+    group,
+    beta=FROZEN_BETA,
+    yes_probabilities=None,
 ):
 
     group = (
@@ -50,18 +51,23 @@ def build_daily_candidates(
         )
     )
 
-    adjusted_yes = (
-        adjusted_probabilities(
-            group=
-                group,
-
-            signal_column=
-                SIGNAL_COLUMN,
-
-            beta=
-                FROZEN_BETA
+    if yes_probabilities is None:
+        adjusted_yes = adjusted_probabilities(
+            group=group,
+            signal_column=SIGNAL_COLUMN,
+            beta=beta,
         )
-    )
+    else:
+        adjusted_yes = np.asarray(yes_probabilities, dtype=float)
+
+        if (
+            adjusted_yes.shape != (len(group),)
+            or not np.isfinite(adjusted_yes).all()
+            or (adjusted_yes < 0).any()
+            or (adjusted_yes > 1).any()
+            or not np.isclose(adjusted_yes.sum(), 1.0, atol=1e-6)
+        ):
+            raise ValueError("Invalid weather probability distribution.")
 
     group[
         "adjusted_yes"
