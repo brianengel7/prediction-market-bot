@@ -12,6 +12,7 @@ __pycache__/
 .env.*
 *.key
 .txt
+.txt.*
 
 # Weather / model data
 *.grib
