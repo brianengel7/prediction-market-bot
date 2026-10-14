@@ -1,0 +1,174 @@
+"""Read-only verification of Kalshi/Polymarket US BTC 15m pairs."""
+
+import argparse
+import asyncio
+import json
+from datetime import datetime, timezone
+from decimal import Decimal as D
+
+import httpx
+
+K_BASE = (
+    "https://external-api.kalshi.com"
+    "/trade-api/v2/markets/"
+)
+P_BASE = (
+    "https://gateway.polymarket.us"
+    "/v1/market/slug/"
+)
+
+
+def parse_time(value):
+    if not isinstance(value, str):
+        return None
+    return datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    ).astimezone(timezone.utc)
+
+
+def decimal_value(value):
+    if isinstance(value, dict):
+        value = value.get("value")
+    if value is None:
+        return None
+    result = D(str(value))
+    return result if result.is_finite() else None
+
+
+async def verify_pair(k_ticker, p_slug):
+    """Return a verification report; never submit orders."""
+    async with httpx.AsyncClient(timeout=12) as client:
+        kr, pr = await asyncio.gather(
+            client.get(K_BASE + k_ticker),
+            client.get(P_BASE + p_slug),
+        )
+
+    kr.raise_for_status()
+    pr.raise_for_status()
+
+    kd = kr.json()
+    pd = pr.json()
+
+    k = kd.get("market", kd)
+    p = pd.get("market", pd)
+
+    terms = p.get("assetPriceTerms") or {}
+    asset = terms.get("asset") or {}
+
+    k_start = parse_time(k.get("open_time"))
+    k_end = parse_time(k.get("close_time"))
+    p_start = parse_time(terms.get("windowStart"))
+    p_end = parse_time(terms.get("windowEnd"))
+
+    k_target = decimal_value(k.get("floor_strike"))
+    p_target = decimal_value(terms.get("priceToBeat"))
+
+    primary = str(k.get("rules_primary") or "").lower()
+    secondary = str(k.get("rules_secondary") or "").lower()
+
+    checks = {
+        "kalshi_ticker": k.get("ticker") == k_ticker,
+        "poly_slug": p.get("slug") == p_slug,
+        "kalshi_ge_rule": (
+            k.get("strike_type") == "greater_or_equal"
+        ),
+        "kalshi_uses_brti": (
+            "brti" in primary
+            and "cf benchmarks" in primary
+        ),
+        "kalshi_sixty_second_average": (
+            "simple average" in primary
+            and "sixty seconds" in primary
+        ),
+        "kalshi_rounds_two_decimals": (
+            "nearest 2 decimal" in secondary
+        ),
+        "poly_up_down": (
+            terms.get("marketType")
+            == "ASSET_PRICE_MARKET_TYPE_UP_DOWN"
+        ),
+        "poly_btc": (
+            str(asset.get("symbol", "")).lower() == "btc"
+            and asset.get("assetClass")
+                == "ASSET_CLASS_CRYPTO"
+        ),
+        "poly_brti": terms.get("indexSymbol") == "BRTI",
+        "poly_15m": terms.get("horizon") == "15m",
+        "same_start": (
+            k_start is not None
+            and k_start == p_start
+        ),
+        "same_end": (
+            k_end is not None
+            and k_end == p_end
+        ),
+        "duration_15m": (
+            k_start is not None
+            and k_end is not None
+            and (k_end - k_start).total_seconds() == 900
+        ),
+        "same_target": (
+            k_target is not None
+            and p_target is not None
+            and k_target == p_target
+        ),
+    }
+
+    # Extra consistency test when the pair has already settled.
+    settlement = decimal_value(terms.get("settlementPrice"))
+    k_result = str(k.get("result") or "").lower()
+
+    if settlement is not None and k_result in ("yes", "no"):
+        checks["settlement_consistency"] = (
+            k_result
+            == ("yes" if settlement >= p_target else "no")
+            if p_target is not None
+            else False
+        )
+
+    passed = all(checks.values())
+
+    return {
+        "pair": {
+            "kalshi": k_ticker,
+            "polymarket_us": p_slug,
+        },
+        "kalshi_target": str(k_target),
+        "poly_target": str(p_target),
+        "kalshi_start": str(k_start),
+        "poly_start": str(p_start),
+        "kalshi_end": str(k_end),
+        "poly_end": str(p_end),
+        "checks": checks,
+        "metadata_verified": passed,
+        "result": (
+            "METADATA_MATCH"
+            if passed else "BLOCK_PAIR"
+        ),
+        "note": (
+            "Metadata/rule check only. "
+            "Does not verify FOK execution, fees, "
+            "live liquidity, or settlement finality."
+        ),
+    }
+
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kalshi", required=True)
+    ap.add_argument("--poly", required=True)
+    args = ap.parse_args()
+
+    report = await verify_pair(
+        args.kalshi, args.poly
+    )
+
+    print(json.dumps(report, indent=2))
+    print("READ ONLY. NO ORDERS SUBMITTED.")
+
+    if not report["metadata_verified"]:
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

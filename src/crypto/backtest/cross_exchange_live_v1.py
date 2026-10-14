@@ -1,806 +1,1742 @@
+"""Independent Kalshi + Polymarket US BTC arbitrage execution pilot.
 
-"""KXBTC15M live execution with independent risk limits.
-
-Default: dry run.
-Real orders require --live and two environment switches.
-All orders use one contract and fill-or-kill.
+PREVIEW by default. LIVE requires explicit verification and approval.
+Two separate exchange orders are never atomic.
 """
 
 import argparse
-import math
+import asyncio
+import base64
+import json
 import os
 import time
-from datetime import timedelta
-from decimal import Decimal
+import uuid
+
+from decimal import Decimal as D
 from pathlib import Path
+from urllib.parse import urlparse
 
-import numpy as np
+import httpx
 
-from src.database.db import get_connection
-from src.crypto.backtest import cross_exchange_shadow_v1 as shadow
-from src.crypto.backtest.cross_exchange_disagreement_walkforward import sigmoid
-from src.kalshi.fees import calculate_taker_fee
-from src.kalshi.live_executor import (
-    build_client_order_id,
-    get_live_fee_multiplier,
-    live_trading_enabled,
+from dotenv import load_dotenv
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, ed25519
+from polymarket_us import AsyncPolymarketUS
+
+from src.crypto import cross_exchange_arb_v2 as scan
+
+
+AUDIT = Path("arb_fast_pilot_orders.jsonl")
+ATTEMPT_LOCK = Path("arb_fast_live_attempt.lock")
+KILL_SWITCH = Path("STOP_ARB_FAST")
+
+# AUTO_DISCOVERY_ONE_SHOT_V1
+AUTO_PAIR_DISCOVERY = (
+    os.getenv("ARB_FAST_AUTO_DISCOVER", "").lower()
+    == "true"
 )
-from src.kalshi.trading_client import (
-    OrderSubmissionUnknownError,
-    find_order_by_client_order_id,
-    get_cash_balance,
-    get_order_fills,
-    place_order,
-    summarize_order_fills,
-)
 
 
-STRATEGY = "KXBTC15M_CROSS_EXCHANGE_V1"
-MAX_SUBMIT_DELAY_SECONDS = 25
-MIN_EDGE = 0.025
-MAX_DAILY_ORDERS = 3
-MAX_DAILY_REALIZED_LOSS = 3.00
-MIN_CASH_BUFFER = 1.00
-KILL_SWITCH = Path("STOP_KXBTC15M_LIVE")
-POLL_SECONDS = 5
-
-
-def enabled():
-    return (
-        live_trading_enabled()
-    )
-
-
-def ensure_table():
-    with get_connection() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS crypto_cross_exchange_live_v1 (
-                ticker TEXT PRIMARY KEY,
-                client_order_id TEXT NOT NULL UNIQUE,
-                created_at TIMESTAMPTZ NOT NULL,
-                decision_time TIMESTAMPTZ NOT NULL,
-                quote_checked_at TIMESTAMPTZ NOT NULL,
-                side TEXT NOT NULL,
-                limit_price DOUBLE PRECISION NOT NULL,
-                fair_probability DOUBLE PRECISION NOT NULL,
-                estimated_fee DOUBLE PRECISION NOT NULL,
-                net_edge DOUBLE PRECISION NOT NULL,
-                contracts INTEGER NOT NULL,
-                order_status TEXT NOT NULL,
-                kalshi_order_id TEXT,
-                fill_count DOUBLE PRECISION,
-                average_fill_price DOUBLE PRECISION,
-                total_fee DOUBLE PRECISION,
-                settlement_result TEXT,
-                actual_pnl DOUBLE PRECISION,
-                last_error TEXT,
-                updated_at TIMESTAMPTZ NOT NULL
-            )
-        """)
-
-
-def update(ticker, **fields):
-    if not fields:
-        return
-
-    fields["updated_at"] = shadow.utcnow()
-    keys = list(fields)
-    sql = ", ".join(f"{name} = ?" for name in keys)
-
-    with get_connection() as db:
-        db.execute(
-            f"UPDATE crypto_cross_exchange_live_v1 SET {sql} WHERE ticker = ?",
-            tuple(fields[key] for key in keys) + (ticker,),
-        )
-
-
-def recent_candidates():
-    now = shadow.utcnow()
-
-    with get_connection() as db:
-        rows = db.execute("""
-            SELECT ticker, close_time, target_decision_time,
-                   quote_received_at, spot_candle_end, floor_strike,
-                   coinbase_close, bitstamp_close,
-                   plus_side, plus_beta_coinbase, plus_beta_disagreement
-            FROM crypto_cross_exchange_shadow_v1
-            WHERE plus_side IN ('YES', 'NO')
-              AND target_decision_time <= ?
-              AND target_decision_time >= ?
-            ORDER BY target_decision_time DESC
-        """, (
-            now,
-            now - timedelta(seconds=MAX_SUBMIT_DELAY_SECONDS),
-        )).fetchall()
-
-    columns = (
-        "ticker", "close_time", "target", "quote_time",
-        "candle_end", "strike", "coinbase", "bitstamp",
-        "side", "beta_c", "beta_d",
-    )
-
-    return [dict(zip(columns, row)) for row in rows]
-
-
-def book_quote(ticker):
-    """Compute executable asks using the opposite-side bids."""
-
-    raw = shadow.get_json(
-        f"{shadow.KALSHI}/markets/{ticker}/orderbook"
-    )
-
-    book = raw.get("orderbook_fp")
-
-    if not isinstance(book, dict):
-        raise ValueError("Missing orderbook_fp")
-
-    def best(name):
-        levels = book.get(name) or []
-
-        parsed = [
-            (Decimal(str(price)), Decimal(str(quantity)))
-            for price, quantity in levels
-        ]
-
-        valid = [
-            (price, quantity)
-            for price, quantity in parsed
-            if 0 < price < 1 and quantity > 0
-        ]
-
-        if not valid:
-            raise ValueError(f"Empty {name} order book")
-
-        return max(valid, key=lambda item: item[0])
-
-    yes_bid, yes_size = best("yes_dollars")
-    no_bid, no_size = best("no_dollars")
-
-    yes_ask = Decimal("1") - no_bid
-    no_ask = Decimal("1") - yes_bid
-
-    if yes_bid >= yes_ask or no_bid >= no_ask:
-        raise ValueError("Locked or crossed order book")
-
-    return {
-        "midpoint": float((yes_bid + yes_ask) / 2),
-        "YES": (float(yes_ask), float(no_size)),
-        "NO": (float(no_ask), float(yes_size)),
+def note(kind, **fields):
+    record = {
+        "kind": kind,
+        "utc": scan.timestamp(),
+        **fields,
     }
-
-
-def check_risk():
-    now = shadow.utcnow()
-    midnight = now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-
-    with get_connection() as db:
-        count, pnl = db.execute("""
-            SELECT COUNT(*), COALESCE(SUM(actual_pnl), 0)
-            FROM crypto_cross_exchange_live_v1
-            WHERE created_at >= ?
-              AND created_at < ?
-              AND order_status NOT IN ('REJECTED', 'ABORTED')
-        """, (
-            midnight,
-            midnight + timedelta(days=1),
-        )).fetchone()
-
-        unresolved = db.execute("""
-            SELECT COUNT(*)
-            FROM crypto_cross_exchange_live_v1
-            WHERE order_status IN (
-                'CLAIMED',
-                'SUBMITTING',
-                'UNKNOWN',
-                'ACK_PENDING',
-                'FILLED_UNRECONCILED'
-            )
-        """).fetchone()[0]
-
-    if count >= MAX_DAILY_ORDERS:
-        raise RuntimeError("Daily BTC order cap reached")
-
-    if float(pnl) <= -MAX_DAILY_REALIZED_LOSS:
-        raise RuntimeError("Daily BTC realized loss limit reached")
-
-    if unresolved:
-        raise RuntimeError(
-            "An unresolved order exists; reconcile before trading"
-        )
-
-    if KILL_SWITCH.exists():
-        raise RuntimeError("BTC kill switch is active")
-
-
-def evaluate(row):
-    """Refresh the Kalshi price and recheck the frozen model."""
-
-    now = shadow.utcnow()
-    target = shadow.parse_utc(row["target"])
-
-    delay = (now - target).total_seconds()
-
-    if not 0 <= delay <= MAX_SUBMIT_DELAY_SECONDS:
-        return None
-
-    if (
-        shadow.parse_utc(row["candle_end"])
-        != target - timedelta(minutes=1)
-    ):
-        raise ValueError("Unexpected exchange candle alignment")
-
-    if (
-        shadow.parse_utc(row["quote_time"])
-        > target + timedelta(seconds=35)
-    ):
-        raise ValueError("Original paper quote was late")
-
-    if (
-        shadow.parse_utc(row["close_time"])
-        != target + timedelta(minutes=5)
-    ):
-        raise ValueError("Contract timing mismatch")
-
-    ticker = row["ticker"]
-
-    if not ticker.startswith("KXBTC15M-"):
-        raise ValueError("Wrong market series")
-
-    details = shadow.market_detail(ticker)
-
-    if (
-        shadow.parse_utc(details["close_time"])
-        != target + timedelta(minutes=5)
-    ):
-        raise ValueError("Live market close time changed")
-
-    if str(details.get("result", "")).lower() in ("yes", "no"):
-        return None
-
-    strike = float(row["strike"])
-
-    if not (strike > 1000 and math.isfinite(strike)):
-        raise ValueError("Invalid strike")
-
-    if not math.isclose(
-        float(details["floor_strike"]),
-        strike,
-        rel_tol=0,
-        abs_tol=0.01,
-    ):
-        raise ValueError("Live strike differs from model strike")
-
-    # Verify the live fee schedule before evaluating an order.
-    multiplier = float(get_live_fee_multiplier(ticker))
-
-    if not math.isclose(multiplier, 1.0, abs_tol=1e-9):
-        raise RuntimeError(
-            "Live fee schedule differs from frozen backtest"
-        )
-
-    cash = float(get_cash_balance())
-
-    # Fetch the executable order book after the other API calls.
-    quote = book_quote(ticker)
-    checked_at = shadow.utcnow()
-
-    if (
-        checked_at - target
-    ).total_seconds() > MAX_SUBMIT_DELAY_SECONDS:
-        return None
-
-    side = str(row["side"]).upper()
-
-    if side not in ("YES", "NO"):
-        raise ValueError("Invalid trading side")
-
-    ask, size = quote[side]
-
-    if size < 1:
-        raise RuntimeError("Insufficient depth for one contract")
-
-    midpoint = quote["midpoint"]
-
-    if not 0 < midpoint < 1:
-        raise ValueError("Invalid Kalshi midpoint")
-
-    # Frozen feature scaling: 10 bps per unit.
-    coinbase = float(row["coinbase"])
-    bitstamp = float(row["bitstamp"])
-
-    coinbase_x = (
-        (coinbase - strike) / strike * 1000.0
-    )
-
-    disagreement_x = (
-        (bitstamp - coinbase) / strike * 1000.0
-    )
-
-    market_logit = math.log(
-        midpoint / (1.0 - midpoint)
-    )
-
-    adjusted_logit = (
-        market_logit
-        + float(row["beta_c"]) * coinbase_x
-        + float(row["beta_d"]) * disagreement_x
-    )
-
-    fair_yes = float(
-        sigmoid(np.array([adjusted_logit]))[0]
-    )
-
-    fair = fair_yes if side == "YES" else 1.0 - fair_yes
-
-    # Do not allow the existing order client to round an
-    # unsupported price to a different executable limit.
-    price_decimal = Decimal(str(ask))
-
-    if price_decimal != price_decimal.quantize(
-        Decimal("0.0001")
-    ):
-        raise RuntimeError("Unsupported price precision")
-
-    fee = calculate_taker_fee(
-        price=ask,
-        contracts=1,
-        multiplier=1,
-    )
-
-    cost = ask + fee
-    edge = fair - cost
-
-    # Preserve the historical rule: trade only the best side.
-    other_side = "NO" if side == "YES" else "YES"
-    other_ask, _ = quote[other_side]
-
-    other_fee = calculate_taker_fee(
-        price=other_ask,
-        contracts=1,
-        multiplier=1,
-    )
-
-    other_edge = (
-        (1.0 - fair)
-        - other_ask
-        - other_fee
-    )
-
-    if edge < MIN_EDGE:
-        return None
-
-    if edge < other_edge:
-        return None
-
-    if cash < cost + MIN_CASH_BUFFER:
-        return None
-
-    return {
-        "ticker": ticker,
-        "target": target,
-        "side": side,
-        "price": ask,
-        "fair": fair,
-        "fee": fee,
-        "cost": cost,
-        "edge": edge,
-        "checked_at": checked_at,
-    }
-
-
-def claim(signal):
-    """Atomically reserve one submission attempt per contract."""
-
-    ticker = signal["ticker"]
-
-    client_order_id = build_client_order_id(
-        strategy=STRATEGY,
-        target_date=signal["target"].date().isoformat(),
-        decision_time=signal["target"],
-        ticker=ticker,
-        side=signal["side"],
-    )
-
-    now = shadow.utcnow()
-
-    with get_connection() as db:
-        row = db.execute("""
-            INSERT INTO crypto_cross_exchange_live_v1 (
-                ticker,
-                client_order_id,
-                created_at,
-                decision_time,
-                quote_checked_at,
-                side,
-                limit_price,
-                fair_probability,
-                estimated_fee,
-                net_edge,
-                contracts,
-                order_status,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'CLAIMED', ?)
-            ON CONFLICT (ticker) DO NOTHING
-            RETURNING ticker
-        """, (
-            ticker,
-            client_order_id,
-            now,
-            signal["target"],
-            signal["checked_at"],
-            signal["side"],
-            signal["price"],
-            signal["fair"],
-            signal["fee"],
-            signal["edge"],
-            now,
-        )).fetchone()
-
-    return client_order_id if row else None
-
-
-def execute(signal):
-    check_risk()
-
-    client_order_id = claim(signal)
-
-    if client_order_id is None:
-        return
-
-    ticker = signal["ticker"]
-
-    # Never automatically resubmit this claimed order.
-    if KILL_SWITCH.exists():
-        update(
-            ticker,
-            order_status="ABORTED",
-            last_error="Kill switch activated",
-        )
-        return
-
-    delay = (
-        shadow.utcnow() - signal["target"]
-    ).total_seconds()
-
-    if delay > MAX_SUBMIT_DELAY_SECONDS:
-        update(
-            ticker,
-            order_status="ABORTED",
-            last_error="Submission deadline exceeded",
-        )
-        return
-
-    update(ticker, order_status="SUBMITTING")
-
-    try:
-        response = place_order(
-            ticker=ticker,
-            side=signal["side"],
-            entry_price=signal["price"],
-            contracts=1,
-            client_order_id=client_order_id,
-            time_in_force="fill_or_kill",
-            timeout=5,
-        )
-
-    except OrderSubmissionUnknownError as error:
-        update(
-            ticker,
-            order_status="UNKNOWN",
-            last_error=str(error)[:500],
-        )
-        print(f"UNKNOWN {ticker}: do not resubmit")
-        return
-
-    except Exception as error:
-        update(
-            ticker,
-            order_status="REJECTED",
-            last_error=str(error)[:500],
-        )
-        print(f"REJECTED {ticker}: {error}")
-        return
-
-    order_id = response.get("order_id")
-
-    update(
-        ticker,
-        kalshi_order_id=order_id,
-        order_status="ACK_PENDING",
-    )
 
     print(
-        f"ORDER_ACK {ticker}: "
-        f"{signal['side']} 1 @ ${signal['price']:.4f}, "
-        f"order_id={order_id}"
+        "FAST_" + kind + " "
+        + json.dumps(record, default=str),
+        flush=True,
+    )
+
+    if kind in (
+        "PREVIEW", "SUBMITTING", "ACK",
+        "FILL_CHECK", "PAIR_FILLED", "NO_FILL",
+        "MATCHED_FILLS_FEES_PENDING",
+        "UNHEDGED_HALT", "UNKNOWN_HALT",
+    ):
+        with AUDIT.open("a") as f:
+            f.write(
+                json.dumps(record, default=str) + "\n"
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+
+class UncertainSubmission(RuntimeError):
+    pass
+
+
+class KalshiOrders:
+    """Independent authenticated Kalshi order client."""
+
+    def __init__(self):
+        self.base = os.getenv(
+            "KALSHI_BASE_URL",
+            "https://external-api.kalshi.com/trade-api/v2",
+        ).rstrip("/")
+
+        self.key_id = os.environ["KALSHI_API_KEY_ID"]
+
+        self.key = serialization.load_pem_private_key(
+            Path(
+                os.environ["KALSHI_PRIVATE_KEY_PATH"]
+            ).read_bytes(),
+            password=None,
+        )
+
+        self.client = httpx.AsyncClient(
+            timeout=3.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=5
+            ),
+        )
+
+    def headers(self, method, path):
+        stamp = str(int(time.time() * 1000))
+
+        message = (
+            stamp
+            + method.upper()
+            + urlparse(self.base + path).path
+        ).encode()
+
+        if isinstance(
+            self.key,
+            ed25519.Ed25519PrivateKey,
+        ):
+            signature = self.key.sign(message)
+        else:
+            signature = self.key.sign(
+                message,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+
+        return {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-TIMESTAMP": stamp,
+            "KALSHI-ACCESS-SIGNATURE":
+                base64.b64encode(signature).decode(),
+            "Content-Type": "application/json",
+        }
+
+    async def get(self, path, **params):
+        response = await self.client.get(
+            self.base + path,
+            headers=self.headers("GET", path),
+            params=params or None,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def prewarm(self):
+        return await self.get("/portfolio/balance")
+
+    async def fok(
+        self, ticker, side, price, quantity, client_id
+    ):
+        path = "/portfolio/events/orders"
+        p = D(str(price))
+
+        if side not in ("yes", "no") or not D(0) < p < D(1):
+            raise ValueError("Invalid Kalshi order")
+
+        yes_price = p if side == "yes" else D(1) - p
+
+        if yes_price != yes_price.quantize(D("0.0001")):
+            raise ValueError("Unsupported price precision")
+
+        body = {
+            "ticker": ticker,
+            "side": "bid" if side == "yes" else "ask",
+            "count": f"{D(quantity):.2f}",
+            "price": f"{yes_price:.4f}",
+            "time_in_force": "fill_or_kill",
+            "client_order_id": client_id,
+            "self_trade_prevention_type": "taker_at_cross",
+            "cancel_order_on_pause": True,
+        }
+
+        started = time.perf_counter_ns()
+
+        try:
+            response = await self.client.post(
+                self.base + path,
+                headers=self.headers("POST", path),
+                json=body,
+            )
+        except (
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ) as exc:
+            raise UncertainSubmission(
+                "Kalshi submission may have reached exchange"
+            ) from exc
+
+        elapsed = (
+            time.perf_counter_ns() - started
+        ) / 1e6
+
+        if response.status_code in (408, 409) or (
+            response.status_code >= 500
+        ):
+            raise UncertainSubmission(
+                f"Kalshi HTTP {response.status_code}"
+            )
+
+        if response.status_code != 201:
+            raise RuntimeError(
+                f"Kalshi rejected {response.status_code}: "
+                f"{response.text[:250]}"
+            )
+
+        try:
+            result = response.json()
+            order = result.get("order", result)
+            order_id = order["order_id"]
+        except Exception as exc:
+            raise UncertainSubmission(
+                "Kalshi accepted order but response is uncertain"
+            ) from exc
+
+        return {
+            "order_id": order_id,
+            "ack_ms": round(elapsed, 2),
+            "raw": order,
+        }
+
+    async def fills(self, order_id):
+        data = await self.get(
+            "/portfolio/fills",
+            order_id=order_id,
+            limit=100,
+        )
+        return data.get("fills", [])
+
+    async def order(self, order_id):
+        return await self.get(
+            "/portfolio/orders/" + str(order_id)
+        )
+
+    async def close(self):
+        await self.client.aclose()
+
+
+class PolyOrders:
+    """Separate official Polymarket US SDK adapter."""
+
+    def __init__(self):
+        self.client = AsyncPolymarketUS(
+            key_id=os.environ["POLYMARKET_KEY_ID"],
+            secret_key=os.environ["POLYMARKET_SECRET_KEY"],
+            timeout=3,
+            max_retries=0,
+        )
+
+    async def open(self):
+        await self.client.__aenter__()
+        return await self.client.account.balances()
+
+
+    # POLY_YES_PRICE_FIX_20261013
+    @staticmethod
+    def payload(slug, side, outcome_price, quantity):
+        # Polymarket API prices are ALWAYS YES-instrument
+        # prices, including ORDER_INTENT_BUY_SHORT.
+        p = D(str(outcome_price))
+
+        if (
+            side not in ("yes", "no")
+            or not D("0") < p < D("1")
+        ):
+            raise ValueError("Invalid Polymarket outcome limit")
+
+        yes_limit = (
+            p if side == "yes" else D("1") - p
+        )
+
+        if not D("0.01") <= yes_limit <= D("0.99"):
+            raise ValueError(
+                "Polymarket YES limit outside permitted range"
+            )
+
+        if int(quantity) != quantity or quantity < 1:
+            raise ValueError(
+                "This pilot requires whole contracts"
+            )
+
+        return {
+            "marketSlug": slug,
+            "intent": (
+                "ORDER_INTENT_BUY_LONG"
+                if side == "yes"
+                else "ORDER_INTENT_BUY_SHORT"
+            ),
+            "type": "ORDER_TYPE_LIMIT",
+            "price": {
+                "value": str(yes_limit),
+                "currency": "USD",
+            },
+            "quantity": int(quantity),
+            "tif": "TIME_IN_FORCE_FILL_OR_KILL",
+            "manualOrderIndicator":
+                "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+            "participateDontInitiate": False,
+        }
+
+    async def preview(
+        self, slug, side, price, quantity
+    ):
+        return await self.client.orders.preview(
+            {"request": self.payload(
+                slug, side, price, quantity
+            )}
+        )
+
+    async def fok(
+        self, slug, side, price, quantity
+    ):
+        started = time.perf_counter_ns()
+
+        try:
+            # FOK_EXECUTION_AUDIT_V1
+            request = self.payload(
+                slug, side, price, quantity
+            )
+
+            if request["tif"] != (
+                "TIME_IN_FORCE_FILL_OR_KILL"
+            ):
+                raise RuntimeError(
+                    "Refusing non-FOK Polymarket order"
+                )
+
+            request["synchronousExecution"] = True
+            request["maxBlockTime"] = "2"
+
+            raw = await self.client.orders.create(
+                request
+            )
+
+            # FOK_ACK_DIAGNOSTIC_V1
+            if isinstance(raw, dict):
+                executions = raw.get("executions") or []
+                orders = []
+                event_types = []
+
+                if isinstance(raw.get("order"), dict):
+                    orders.append(raw["order"])
+
+                if isinstance(executions, list):
+                    for event in executions:
+                        if not isinstance(event, dict):
+                            continue
+                        event_types.append(event.get("type"))
+                        if isinstance(event.get("order"), dict):
+                            orders.append(event["order"])
+
+                print(
+                    "POLY_FOK_ACK_DIAGNOSTIC "
+                    + json.dumps({
+                        "requested_tif": request["tif"],
+                        "response_order_id": (
+                            raw.get("id")
+                            or raw.get("orderId")
+                        ),
+                        "exchange_reported_tifs": [
+                            o.get("tif") for o in orders
+                        ],
+                        "exchange_order_states": [
+                            o.get("state") for o in orders
+                        ],
+                        "execution_types": event_types,
+                    }, default=str),
+                    flush=True,
+                )
+        except Exception as exc:
+            if type(exc).__name__ in (
+                "APITimeoutError",
+                "APIConnectionError",
+                "TimeoutError",
+            ):
+                raise UncertainSubmission(
+                    "Polymarket submission state uncertain"
+                ) from exc
+            raise
+
+        elapsed = (
+            time.perf_counter_ns() - started
+        ) / 1e6
+
+        order = (
+            raw.get("order", raw)
+            if isinstance(raw, dict)
+            else {}
+        )
+
+        order_id = (
+            order.get("id")
+            or order.get("orderId")
+        )
+
+        if not order_id:
+            raise UncertainSubmission(
+                "Polymarket response missing order ID"
+            )
+
+        return {
+            "order_id": order_id,
+            "ack_ms": round(elapsed, 2),
+            "raw": raw,
+        }
+
+    async def order(self, order_id):
+        return await self.client.orders.retrieve(
+            order_id
+        )
+
+    async def close(self):
+        await self.client.__aexit__(
+            None, None, None
+        )
+
+
+
+# FILL_RECON_V2_20261013
+# Reconciliation only: no order submission.
+
+def _money(value):
+    if isinstance(value, dict):
+        value = value.get("value")
+    if value in (None, ""):
+        return None
+
+    result = D(str(value))
+
+    if not result.is_finite():
+        raise ValueError("Non-finite exchange amount")
+
+    return result
+
+
+def _kalshi_fills(fills, side, expected_id):
+    count = D(0)
+    cost = D(0)
+    fees = D(0)
+    fees_complete = True
+    seen = set()
+
+    price_key = (
+        "no_price_dollars"
+        if side == "no"
+        else "yes_price_dollars"
+    )
+
+    for fill in fills:
+        if not isinstance(fill, dict):
+            raise ValueError("Invalid Kalshi fill")
+
+        if fill.get("order_id") not in (
+            None, expected_id
+        ):
+            raise ValueError("Wrong order ID in fill")
+
+        fill_id = fill.get("fill_id")
+
+        if fill_id is not None and fill_id in seen:
+            continue
+
+        if fill_id is not None:
+            seen.add(fill_id)
+
+        q = _money(
+            fill.get("count_fp", fill.get("count"))
+        )
+        px = _money(fill.get(price_key))
+
+        if (
+            q is None
+            or px is None
+            or q <= 0
+            or not 0 < px < 1
+        ):
+            raise ValueError(
+                "Invalid Kalshi fill quantity or price"
+            )
+
+        fee = _money(fill.get("fee_cost"))
+
+        if fee is None:
+            fees_complete = False
+        elif fee < 0:
+            raise ValueError("Negative fee")
+        else:
+            fees += fee
+
+        count += q
+        cost += q * px
+
+    return (
+        count,
+        cost,
+        fees if fees_complete else None,
     )
 
 
-def reconcile():
-    """Recover submitted orders and calculate actual fills."""
+async def reconcile_pair(
+    pilot, kalshi, poly,
+    k_result, p_result, quantity
+):
+    """Poll both exchanges without submitting new orders."""
 
-    with get_connection() as db:
-        pending = db.execute("""
-            SELECT
-                ticker,
-                client_order_id,
-                kalshi_order_id,
-                side
-            FROM crypto_cross_exchange_live_v1
-            WHERE order_status IN (
-                'CLAIMED',
-                'SUBMITTING',
-                'UNKNOWN',
-                'ACK_PENDING',
-                'FILLED_UNRECONCILED'
+    target = D(str(quantity))
+
+    k_id = (
+        k_result.get("order_id")
+        if isinstance(k_result, dict)
+        else None
+    )
+    p_id = (
+        p_result.get("order_id")
+        if isinstance(p_result, dict)
+        else None
+    )
+
+    if not k_id or not p_id:
+        note(
+            "UNKNOWN_HALT",
+            reason="One or both order IDs missing",
+            kalshi_id=k_id,
+            poly_id=p_id,
+            kalshi_error=(
+                repr(k_result)
+                if isinstance(k_result, Exception)
+                else None
+            ),
+            poly_error=(
+                repr(p_result)
+                if isinstance(p_result, Exception)
+                else None
+            ),
+            instruction=(
+                "Inspect both accounts. "
+                "Do not resubmit."
+            ),
+        )
+
+    k_terminal = {
+        "executed",
+        "filled",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "expired",
+    }
+
+    p_terminal = {
+        "ORDER_STATE_FILLED",
+        "ORDER_STATE_CANCELED",
+        "ORDER_STATE_REJECTED",
+        "ORDER_STATE_EXPIRED",
+    }
+
+    last = {}
+    deadline = time.monotonic() + 12.0
+
+    while time.monotonic() < deadline:
+
+        async def read_k():
+            if not k_id:
+                return None
+            return await pilot.k.order(k_id)
+
+        async def read_fills():
+            if not k_id:
+                return None
+            return await pilot.k.fills(k_id)
+
+        async def read_p():
+            if not p_id:
+                return None
+            return await pilot.p.order(p_id)
+
+        kr, fills, pr = await asyncio.gather(
+            read_k(),
+            read_fills(),
+            read_p(),
+            return_exceptions=True,
+        )
+
+        errors = {
+            key: (
+                f"{type(value).__name__}: {value}"
             )
-        """).fetchall()
+            for key, value in (
+                ("kalshi_order", kr),
+                ("kalshi_fills", fills),
+                ("polymarket_order", pr),
+            )
+            if isinstance(value, BaseException)
+        }
 
-    for ticker, client_id, order_id, side in pending:
-        try:
-            if not order_id:
-                found = find_order_by_client_order_id(
-                    client_id,
-                    ticker=ticker,
-                )
+        ko = (
+            kr.get("order", kr)
+            if isinstance(kr, dict)
+            else None
+        )
 
-                if not found or not found.get("order_id"):
-                    # Submission state remains ambiguous.
-                    # Do not retry it.
-                    continue
+        po = (
+            pr.get("order", pr)
+            if isinstance(pr, dict)
+            else None
+        )
 
-                order_id = found["order_id"]
+        if not isinstance(ko, dict):
+            ko = None
 
-                update(
-                    ticker,
-                    kalshi_order_id=order_id,
-                    order_status="ACK_PENDING",
-                )
+        if not isinstance(po, dict):
+            po = None
 
-            fills = get_order_fills(order_id)
+        ks = (
+            str(ko.get("status", "")).lower()
+            if ko
+            else "UNKNOWN"
+        )
 
-            summary = summarize_order_fills(
-                fills=fills,
-                outcome_side=side,
+        ps = (
+            str(po.get("state", ""))
+            if po
+            else "UNKNOWN"
+        )
+
+        last = {
+            "ko": ko,
+            "po": po,
+            "fills": fills,
+            "errors": errors,
+            "kalshi_status": ks,
+            "poly_status": ps,
+        }
+
+        if (
+            k_id
+            and p_id
+            and isinstance(fills, list)
+            and ks in k_terminal
+            and ps in p_terminal
+        ):
+            break
+
+        await asyncio.sleep(0.3)
+
+    po = last.get("po")
+    fills = last.get("fills")
+    ks = last.get(
+        "kalshi_status", "UNKNOWN"
+    )
+    ps = last.get(
+        "poly_status", "UNKNOWN"
+    )
+    errs = last.get("errors", {})
+
+    k_qty = None
+    k_cost = None
+    k_fees = None
+    p_qty = None
+    p_avg = None
+    p_cost = None
+
+    try:
+        if isinstance(fills, list):
+            k_qty, k_cost, k_fees = _kalshi_fills(
+                fills, kalshi[2], k_id
             )
 
-            filled = float(summary["fill_count"])
+        if po is not None:
+            p_qty = _money(
+                po.get("cumQuantity")
+            )
 
-            if filled >= 1:
-                update(
-                    ticker,
-                    order_status="FILLED",
-                    fill_count=filled,
-                    average_fill_price=summary["average_fill_price"],
-                    total_fee=summary["total_fee"],
-                )
+            p_avg = _money(
+                po.get("avgPx")
+            )
 
-                print(
-                    f"FILLED {ticker}: "
-                    f"{filled:g} @ "
-                    f"${summary['average_fill_price']:.4f}"
-                )
-
-            else:
-                found = find_order_by_client_order_id(
-                    client_id,
-                    ticker=ticker,
-                )
-
-                server_status = str(
-                    (found or {}).get("status", "")
-                ).lower()
-
-                reported = (found or {}).get("fill_count_fp")
-
-                if reported is None:
-                    reported = (found or {}).get("fill_count")
-
+            if (
+                p_qty is not None
+                and p_avg is not None
+            ):
                 if (
-                    server_status in ("canceled", "cancelled")
-                    and reported is not None
-                    and float(reported) == 0
+                    p_qty > 0
+                    and not D(0) < p_avg < D(1)
                 ):
-                    update(
-                        ticker,
-                        order_status="NO_FILL",
-                        fill_count=0,
-                    )
-                    print(f"NO_FILL {ticker}")
-
-                elif (
-                    reported is not None
-                    and float(reported) > 0
-                ):
-                    update(
-                        ticker,
-                        order_status="FILLED_UNRECONCILED",
+                    raise ValueError(
+                        "Invalid Polymarket execution price"
                     )
 
+                if poly[2] == "no":
+                    # BUY_SHORT sells YES.
+                    # Effective NO cost = 1 - YES sale price.
+                    p_cost = p_qty * (D(1) - p_avg)
+                elif poly[2] == "yes":
+                    p_cost = p_qty * p_avg
                 else:
-                    update(
-                        ticker,
-                        order_status="ACK_PENDING",
+                    raise ValueError(
+                        "Unsupported Polymarket outcome"
                     )
 
-        except Exception as error:
-            print(
-                f"RECONCILE_ERROR {ticker}: "
-                f"{type(error).__name__}: {error}"
+    except (
+        ValueError,
+        TypeError,
+        ArithmeticError,
+    ) as exc:
+        errs["fill_parse"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    tif = (
+        po.get("tif") if po else None
+    )
+
+    poly_commission_field = (
+        po.get(
+            "commissionNotionalTotalCollected"
+        )
+        if po
+        else None
+    )
+
+    note(
+        "FILL_CHECK",
+        kalshi_order_id=k_id,
+        poly_order_id=p_id,
+        kalshi_status=ks,
+        polymarket_status=ps,
+        polymarket_tif=tif,
+        kalshi_quantity=(
+            str(k_qty)
+            if k_qty is not None else None
+        ),
+        polymarket_quantity=(
+            str(p_qty)
+            if p_qty is not None else None
+        ),
+        kalshi_cost=(
+            str(k_cost)
+            if k_cost is not None else None
+        ),
+        kalshi_actual_fees=(
+            str(k_fees)
+            if k_fees is not None else None
+        ),
+        polymarket_execution_avg_px=(
+            str(p_avg)
+            if p_avg is not None else None
+        ),
+        polymarket_effective_outcome_cost=(
+            str(p_cost)
+            if p_cost is not None else None
+        ),
+        polymarket_commission_field_unverified=(
+            poly_commission_field
+        ),
+        errors=errs,
+    )
+
+    both_terminal = (
+        ks in k_terminal
+        and ps in p_terminal
+    )
+
+    matched = (
+        not errs
+        and both_terminal
+        and k_qty == target
+        and p_qty == target
+        and k_cost is not None
+        and k_fees is not None
+        and p_avg is not None
+        and p_avg > 0
+        and po.get("intent") == (
+            "ORDER_INTENT_BUY_SHORT"
+            if poly[2] == "no"
+            else "ORDER_INTENT_BUY_LONG"
+        )
+        and po.get("outcomeSide") == (
+            "OUTCOME_SIDE_NO"
+            if poly[2] == "no"
+            else "OUTCOME_SIDE_YES"
+        )
+        and tif
+            == "TIME_IN_FORCE_FILL_OR_KILL"
+    )
+
+    if matched:
+        gross_less_k_fee = (
+            target
+            - k_cost
+            - p_cost
+            - k_fees
+        )
+
+        note(
+            "MATCHED_FILLS_FEES_PENDING",
+            quantity=str(target),
+            gross_less_kalshi_fee=(
+                str(gross_less_k_fee)
+            ),
+            polymarket_actual_fee=(
+                "NOT_VERIFIED"
+            ),
+            warning=(
+                "Matched quantities are not "
+                "verified profit. Confirm "
+                "Polymarket fees and settlement."
+            ),
+        )
+
+    elif (
+        both_terminal
+        and k_qty == 0
+        and p_qty == 0
+        and not errs
+    ):
+        note(
+            "NO_FILL",
+            message="Neither exchange filled",
+        )
+
+    elif (
+        k_qty is not None
+        and p_qty is not None
+        and k_qty != p_qty
+    ):
+        note(
+            "UNHEDGED_HALT",
+            kalshi_quantity=str(k_qty),
+            poly_quantity=str(p_qty),
+            warning=(
+                "Unmatched position. "
+                "Inspect both accounts."
+            ),
+        )
+
+    else:
+        note(
+            "UNKNOWN_HALT",
+            reason=(
+                "Order state, FOK policy, "
+                "price or fills not verified"
+            ),
+            kalshi_status=ks,
+            poly_status=ps,
+            poly_tif=tif,
+            errors=errs,
+            instruction=(
+                "Reconcile manually. "
+                "Do not resubmit."
+            ),
+        )
+
+
+class Pilot:
+    def __init__(self, args):
+        self.args = args
+        self.k = None
+        self.p = None
+        self.busy = False
+        self.live_attempted = False
+        self.preflight_sides = set()
+        self.preview_count = 0
+        self.last_preview_time = 0.0
+        self.pending = set()
+
+    async def open(self):
+        self.k = KalshiOrders()
+        self.p = PolyOrders()
+
+        try:
+            kb, pb = await asyncio.gather(
+                self.k.prewarm(),
+                self.p.open(),
+            )
+        except Exception:
+            await self.close()
+            raise
+
+        note(
+            "AUTH_OK",
+            kalshi_balance_present=bool(kb),
+            poly_balance_present=bool(pb),
+            mode=self.args.mode,
+        )
+
+    async def close(self):
+        if self.k is not None:
+            await self.k.close()
+
+        if self.p is not None:
+            await self.p.close()
+
+    def observe(self, engine, kind, legs):
+        a = self.args
+        # ONE_SHOT_DIRECT_LIVE_V1
+        # Price the exact quantity the executor will order.
+        if a.mode == "live":
+            engine.args.eval_qty = D(a.qty)
+
+        if (
+            kind != "CROSS_EXCHANGE"
+            or self.busy
+            or self.live_attempted
+        ):
+            return
+
+        if len(legs) != 2 or any(
+            x is None for x in legs
+        ):
+            return
+
+        # KYES_PNO_LIVE_V1
+        # Allow both complementary cross-exchange directions.
+        if a.mode == "live":
+            if not (
+                legs[0].venue == "kalshi"
+                and legs[1].venue == "polymarket_us"
+                and (
+                    (legs[0].side, legs[1].side)
+                    in {("no", "yes"), ("yes", "no")}
+                )
+            ):
+                return
+
+        state = engine.state
+        now = time.monotonic()
+
+        kb = (
+            state.books.get(state.kalshi_btc)
+            if state.kalshi_btc else None
+        )
+
+        if not (
+            kb
+            and kb.ready
+            and state.poly.ready
+            and state.poly_slug
+        ):
+            return
+
+        max_age = a.max_age_ms / 1000
+
+        if max(
+            now - kb.seen,
+            now - state.poly.seen,
+        ) > max_age:
+            return
+
+        if a.mode == "live":
+            if AUTO_PAIR_DISCOVERY:
+                # Use the scanner's active market pair.
+                if (
+                    not state.kalshi_btc
+                    or not state.poly_slug
+                    or legs[0].ticker != state.kalshi_btc
+                    or legs[1].ticker != state.poly_slug
+                ):
+                    return
+            elif (
+                state.kalshi_btc != a.approved_kalshi
+                or state.poly_slug != a.approved_poly
+            ):
+                return
+
+        elif self.preview_count >= a.max_previews:
+            return
+
+        if now - self.last_preview_time < 3:
+            return
+
+        record = scan.priced_spread(
+            "CROSS_EXCHANGE",
+            legs,
+            engine.args,
+            {"rule_match": state.pair_status},
+        )
+
+        if record is None:
+            return
+
+        if (
+            D(record["buffered_cents_per_pair"])
+            < a.min_net_cents
+        ):
+            return
+
+        if (
+            D(record["evaluated_pairs"]) < a.qty
+            or any(x.size < a.qty for x in legs)
+        ):
+            return
+
+        pair = [
+            (
+                x.venue, x.ticker,
+                x.side, str(x.price)
+            )
+            for x in legs
+        ]
+
+        if (
+            pair[0][0] != "kalshi"
+            or pair[1][0] != "polymarket_us"
+        ):
+            return
+
+        self.busy = True
+        self.last_preview_time = now
+
+        task = asyncio.create_task(
+            self.act(
+                engine,
+                pair,
+                record,
+                time.perf_counter_ns(),
+            )
+        )
+
+        self.pending.add(task)
+        task.add_done_callback(self.pending.discard)
+
+    async def act(
+        self, engine, pair, row, detected_ns
+    ):
+        a = self.args
+
+        try:
+            kalshi, poly = pair
+
+            # Preview does not submit real orders.
+            if (
+                a.mode == "preview"
+                or (
+                    a.mode != "live"
+                    and poly[2] not in self.preflight_sides
+                )
+            ):
+                started = time.perf_counter_ns()
+
+                preview = await self.p.preview(
+                    poly[1],
+                    poly[2],
+                    poly[3],
+                    a.qty,
+                )
+
+                self.preview_count += 1
+                self.preflight_sides.add(poly[2])
+
+                note(
+                    "PREVIEW",
+                    direction=(
+                        kalshi[2], poly[2]
+                    ),
+                    prices=[
+                        kalshi[3], poly[3]
+                    ],
+                    qty=a.qty,
+                    net_est_cents=row[
+                        "buffered_cents_per_pair"
+                    ],
+                    latency_ms=round(
+                        (
+                            time.perf_counter_ns()
+                            - started
+                        ) / 1e6,
+                        2,
+                    ),
+                    details=preview,
+                )
+
+                if a.mode == "live":
+                    note(
+                        "PREFLIGHT_READY",
+                        message=(
+                            "No orders sent on this signal. "
+                            "Waiting for another fresh edge."
+                        ),
+                    )
+
+                return
+
+            # Recheck both order books.
+            state = engine.state
+
+            if (
+                state.kalshi_btc != kalshi[1]
+                or state.poly_slug != poly[1]
+            ):
+                return
+
+            kb = state.books.get(kalshi[1])
+
+            if not (
+                kb and kb.ready and state.poly.ready
+            ):
+                return
+
+            max_age = a.max_age_ms / 1000
+            now = time.monotonic()
+
+            if max(
+                now - kb.seen,
+                now - state.poly.seen,
+            ) > max_age:
+                return
+
+            k_leg = kb.ask(
+                kalshi[1],
+                kalshi[2],
+                max_age,
             )
 
-    # Use real fills and final contract results for P&L.
-    with get_connection() as db:
-        settled = db.execute("""
-            SELECT
-                l.ticker,
-                l.side,
-                l.fill_count,
-                l.average_fill_price,
-                l.total_fee,
-                s.settlement_result
-            FROM crypto_cross_exchange_live_v1 l
-            JOIN crypto_cross_exchange_shadow_v1 s
-              ON s.ticker = l.ticker
-            WHERE l.order_status = 'FILLED'
-              AND l.actual_pnl IS NULL
-              AND s.settlement_result IN ('yes', 'no')
-        """).fetchall()
+            p_leg = state.poly.ask(
+                poly[1],
+                poly[2],
+                max_age,
+            )
 
-    for ticker, side, qty, price, fees, result in settled:
-        if None in (qty, price, fees):
-            continue
+            if not k_leg or not p_leg:
+                return
 
-        payout = (
-            float(qty) if side.lower() == result else 0.0
+            if (
+                k_leg.size < a.qty
+                or p_leg.size < a.qty
+            ):
+                return
+
+            # Never chase worse entry prices.
+            if (
+                k_leg.price > D(kalshi[3])
+                or p_leg.price > D(poly[3])
+            ):
+                return
+
+            latest = scan.priced_spread(
+                "CROSS_EXCHANGE",
+                [k_leg, p_leg],
+                engine.args,
+            )
+
+            if (
+                latest is None
+                or D(
+                    latest["buffered_cents_per_pair"]
+                ) < a.min_net_cents
+            ):
+                return
+
+            if (
+                k_leg.price + p_leg.price
+                > a.max_combined_price
+            ):
+                return
+
+            if KILL_SWITCH.exists():
+                return
+
+            self.live_attempted = True
+            client_id = str(uuid.uuid4())
+
+            # Durable lock prevents duplicate attempts.
+            try:
+                fd = os.open(
+                    ATTEMPT_LOCK,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                note(
+                    "UNKNOWN_HALT",
+                    message="Existing live-attempt lock",
+                )
+                return
+
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({
+                    "at": scan.timestamp(),
+                    "client_order_id": client_id,
+                    "kalshi": kalshi[1],
+                    "poly": poly[1],
+                }) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+            note(
+                "SUBMITTING",
+                pair=pair,
+                submitted_limit_prices=[
+                    str(k_leg.price),
+                    str(p_leg.price),
+                ],
+                client_id=client_id,
+                qty=a.qty,
+                observed_to_submit_ms=round(
+                    (
+                        time.perf_counter_ns()
+                        - detected_ns
+                    ) / 1e6,
+                    2,
+                ),
+                net_est_cents=latest[
+                    "buffered_cents_per_pair"
+                ],
+            )
+
+            # Concurrent FOK is NOT atomic.
+            k_result, p_result = await asyncio.gather(
+                self.k.fok(
+                    kalshi[1], kalshi[2],
+                    str(k_leg.price), a.qty, client_id,
+                ),
+                self.p.fok(
+                    poly[1], poly[2],
+                    str(p_leg.price), a.qty,
+                ),
+                return_exceptions=True,
+            )
+
+            note(
+                "ACK",
+                kalshi=(
+                    repr(k_result)
+                    if isinstance(k_result, Exception)
+                    else k_result
+                ),
+                poly=(
+                    repr(p_result)
+                    if isinstance(p_result, Exception)
+                    else p_result
+                ),
+            )
+
+            await reconcile_pair(
+                self,
+                kalshi,
+                poly,
+                k_result,
+                p_result,
+                a.qty,
+            )
+
+        except Exception as exc:
+            note(
+                "UNKNOWN_HALT",
+                error=(
+                    f"{type(exc).__name__}: "
+                    f"{str(exc)[:250]}"
+                ),
+            )
+
+        finally:
+            self.busy = False
+            if a.mode == "live" and self.live_attempted:
+                note(
+                    "ONE_SHOT_ATTEMPT_FINISHED",
+                    message=(
+                        "Submission attempt and "
+                        "reconciliation routine ended"
+                    ),
+                )
+
+
+
+
+async def preflight_ws_book(slug):
+    """Get current top of book from authenticated WS.
+
+    Read-only: never creates, modifies or cancels orders.
+    """
+
+    state = scan.State(poly_slug=slug)
+
+    class BookObserver:
+        def check(self, changed=None):
+            pass
+
+    task = asyncio.create_task(
+        scan.poly_stream(state, BookObserver())
+    )
+
+    try:
+        deadline = time.monotonic() + 12
+
+        while time.monotonic() < deadline:
+            book = state.poly
+
+            if (
+                book.ready
+                and time.monotonic() - book.seen < 1.0
+            ):
+                bid = scan.best(
+                    book.bids, high=True
+                )
+                ask = scan.best(book.offers)
+
+                if bid and ask and bid[0] < ask[0]:
+                    print(
+                        "FAST_WS_BOOK_OK "
+                        f"slug={slug} "
+                        f"YES_bid={bid[0]} "
+                        f"YES_ask={ask[0]} "
+                        f"bid_qty={bid[1]} "
+                        f"ask_qty={ask[1]}",
+                        flush=True,
+                    )
+
+                    return {
+                        "marketData": {
+                            "state": "MARKET_STATE_OPEN",
+                            "bids": [{
+                                "px": {
+                                    "value": str(bid[0])
+                                },
+                                "qty": str(bid[1]),
+                            }],
+                            "offers": [{
+                                "px": {
+                                    "value": str(ask[0])
+                                },
+                                "qty": str(ask[1]),
+                            }],
+                        }
+                    }
+
+            if task.done():
+                raise RuntimeError(
+                    "Polymarket WebSocket stopped "
+                    "before providing a valid book"
+                )
+
+            await asyncio.sleep(0.05)
+
+        raise TimeoutError(
+            "No valid two-sided Polymarket BTC "
+            "book received within 12 seconds"
         )
 
-        pnl = (
-            payout
-            - float(qty) * float(price)
-            - float(fees)
+    finally:
+        task.cancel()
+        await asyncio.gather(
+            task, return_exceptions=True
         )
 
-        update(
-            ticker,
-            settlement_result=result,
-            actual_pnl=pnl,
-            order_status="SETTLED",
+
+async def preflight_orders(pilot, approved=None):
+    """Authenticated preview. Never submits orders."""
+
+    discover_args = argparse.Namespace(
+        extra_kalshi_series=[],
+        max_extra=1,
+    )
+
+    metadata, kalshi, poly, close = (
+        await asyncio.to_thread(
+            scan.discover, discover_args
+        )
+    )
+
+    if not kalshi or not poly:
+        raise RuntimeError(
+            "Current BTC pair not listed yet; "
+            "wait and retry preflight"
+        )
+
+    if (
+        approved is not None
+        and approved != (kalshi, poly)
+    ):
+        raise RuntimeError(
+            "Current BTC market differs from "
+            "approved market IDs; no orders"
+        )
+
+    raw_market = await pilot.p.client.markets.retrieve_by_slug(
+        poly
+    )
+    raw_book = await preflight_ws_book(poly)
+
+    market = raw_market.get(
+        "market", raw_market
+    )
+    book = raw_book.get(
+        "marketData", raw_book
+    )
+
+    if (
+        not isinstance(market, dict)
+        or not isinstance(book, dict)
+    ):
+        raise RuntimeError(
+            "Unexpected Polymarket market/book response"
+        )
+
+    if book.get("state") not in (
+        None, "OPEN", "MARKET_STATE_OPEN"
+    ):
+        raise RuntimeError("Polymarket market is not open")
+
+    bids = scan.best(
+        scan.poly_levels(book.get("bids")),
+        high=True,
+    )
+    offers = scan.best(
+        scan.poly_levels(book.get("offers"))
+    )
+
+    if (
+        not bids or not offers
+        or bids[0] >= offers[0]
+    ):
+        raise RuntimeError(
+            "No valid two-sided Polymarket book"
+        )
+
+    tick = D(str(
+        market.get("orderPriceMinTickSize") or "0.01"
+    ))
+    min_qty = D(str(
+        market.get("minimumTradeQty") or "1"
+    ))
+
+    if (
+        min_qty > pilot.args.qty
+        or min_qty <= 0
+        or tick <= 0
+    ):
+        raise RuntimeError(
+            "Quantity below market minimum "
+            "or invalid tick"
+        )
+
+    note(
+        "CONTRACT_TERMS",
+        kalshi=kalshi,
+        poly=poly,
+        close=str(close),
+        kalshi_rule=metadata[kalshi].get("rules_primary"),
+        poly_rules={
+            k: v for k, v in market.items()
+            if any(
+                word in k.lower()
+                for word in (
+                    "rule", "description",
+                    "question", "resolution", "settle"
+                )
+            )
+        },
+        minimum_qty=str(min_qty),
+        price_tick=str(tick),
+    )
+
+    for side, outcome_cost in (
+        ("yes", offers[0]),
+        ("no", D("1") - bids[0]),
+    ):
+        payload = pilot.p.payload(
+            poly, side, outcome_cost, pilot.args.qty
+        )
+
+        yes_limit = D(payload["price"]["value"])
+
+        if yes_limit % tick != 0:
+            raise RuntimeError(
+                f"{side}: limit price not aligned to tick"
+            )
+
+        started = time.perf_counter_ns()
+
+        preview = await pilot.p.preview(
+            poly, side, outcome_cost, pilot.args.qty
+        )
+
+        note(
+            "PREFLIGHT",
+            kalshi=kalshi,
+            poly=poly,
+            side=side,
+            outcome_cost=str(outcome_cost),
+            yes_instrument_limit=str(yes_limit),
+            intent=payload["intent"],
+            quantity=pilot.args.qty,
+            preview_ms=round(
+                (
+                    time.perf_counter_ns() - started
+                ) / 1e6,
+                2,
+            ),
+            response=preview,
+        )
+
+    note(
+        "PREFLIGHT_OK",
+        kalshi=kalshi,
+        poly=poly,
+        message=(
+            "No orders submitted. "
+            "Review fees and rules before LIVE."
+        ),
+    )
+
+    return kalshi, poly
+
+
+def arguments():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument(
+        "--mode",
+        choices=["preflight", "preview", "live"],
+        default="preview",
+    )
+    ap.add_argument(
+        "--minutes", type=float, default=30
+    )
+    ap.add_argument(
+        "--qty", type=int, default=1
+    )
+    ap.add_argument(
+        "--min-net-cents",
+        type=D, default=D("5"),
+    )
+    ap.add_argument(
+        "--max-age-ms",
+        type=float, default=100,
+    )
+    ap.add_argument(
+        "--max-combined-price",
+        type=D, default=D("0.90"),
+    )
+    ap.add_argument(
+        "--max-previews",
+        type=int, default=3,
+    )
+    ap.add_argument("--approved-kalshi")
+    ap.add_argument("--approved-poly")
+    ap.add_argument(
+        "--rules-and-fees-verified",
+        action="store_true",
+    )
+    ap.add_argument(
+        "--accept-leg-risk",
+        action="store_true",
+    )
+    ap.add_argument(
+        "--balances-confirmed",
+        action="store_true",
+    )
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+    )
+
+    ap.add_argument(
+        "--with-weather",
+        action="store_true",
+        help="Include NYC and Miami Kalshi weather books",
+    )
+    return ap.parse_args()
+
+
+async def main():
+    args = arguments()
+
+    if args.self_test:
+        assert PolyOrders.payload(
+            "demo", "no", "0.45", 1
+        )["intent"] == "ORDER_INTENT_BUY_SHORT"
+
+        assert PolyOrders.payload(
+            "demo", "yes", "0.55", 1
+        )["tif"] == "TIME_IN_FORCE_FILL_OR_KILL"
+
+        assert PolyOrders.payload(
+            "demo", "no", "0.83", 1
+        )["price"]["value"] == "0.17"
+
+        assert PolyOrders.payload(
+            "demo", "yes", "0.55", 1
+        )["price"]["value"] == "0.55"
+
+        assert PolyOrders.payload(
+            "demo", "no", "0.83", 1
+        )["manualOrderIndicator"] == (
+            "MANUAL_ORDER_INDICATOR_AUTOMATIC"
         )
 
         print(
-            f"LIVE_SETTLED {ticker}: "
-            f"{result} pnl=${pnl:+.2f}"
+            "PASS: Order construction self-test. "
+            "No orders submitted."
+        )
+        return
+
+    if (
+        args.qty != 1
+        or not D(0)
+        < args.max_combined_price
+        < D(1)
+    ):
+        raise SystemExit(
+            "Pilot requires qty=1 and combined price below $1"
         )
 
+    if (
+        args.minutes <= 0
+        or args.max_age_ms <= 0
+        or args.min_net_cents < 0
+    ):
+        raise SystemExit("Invalid settings")
 
-def poll(live, seen):
-    # Reuse the complete existing shadow decision process.
-    shadow.poll(quiet=True)
+    load_dotenv(
+        dotenv_path=(
+            Path(__file__).resolve().parents[3]
+            / ".env"
+        )
+    )
 
-    for row in recent_candidates():
-        ticker = row["ticker"]
+    if args.mode == "live":
+        if not (
+            os.getenv(
+                "KALSHI_LIVE_TRADING_ENABLED", ""
+            ).lower() == "true"
+            and (
+                AUTO_PAIR_DISCOVERY
+                or (
+                    args.approved_kalshi
+                    and args.approved_poly
+                )
+            )
+            and args.rules_and_fees_verified
+            and args.accept_leg_risk
+            and args.balances_confirmed
+        ):
+            raise SystemExit(
+                "LIVE BLOCKED: explicit verification and "
+                "approval required"
+            )
 
-        if ticker in seen:
-            continue
+        if ATTEMPT_LOCK.exists():
+            raise SystemExit(
+                "LIVE BLOCKED: previous attempt unresolved"
+            )
 
-        with get_connection() as db:
-            exists = db.execute("""
-                SELECT 1
-                FROM crypto_cross_exchange_live_v1
-                WHERE ticker = ?
-            """, (ticker,)).fetchone()
+        if KILL_SWITCH.exists():
+            raise SystemExit(
+                "LIVE BLOCKED: STOP_ARB_FAST exists"
+            )
 
-        if exists:
-            seen.add(ticker)
-            continue
+    pilot = Pilot(args)
+    await pilot.open()
 
+    if args.mode in ("preflight", "live"):
         try:
-            signal = evaluate(row)
-
-            if signal is None:
-                continue
-
-            seen.add(ticker)
-
-            mode = "LIVE" if live else "DRY RUN"
-
-            print(
-                f"ELIGIBLE {ticker}: "
-                f"{signal['side']} "
-                f"@ ${signal['price']:.4f}, "
-                f"edge={signal['edge']:.2%} | {mode}"
+            # AUTO_PREFLIGHT_APPROVAL_V2
+            # Automatic mode validates the discovered pair.
+            # Manual mode still enforces explicit IDs.
+            approved = (
+                None
+                if AUTO_PAIR_DISCOVERY
+                else (
+                    (
+                        args.approved_kalshi,
+                        args.approved_poly,
+                    )
+                    if args.mode == "live"
+                    else None
+                )
             )
 
-            if live:
-                execute(signal)
+            await preflight_orders(pilot, approved)
 
-        except Exception as error:
-            print(
-                f"BTC_BLOCKED {ticker}: "
-                f"{type(error).__name__}: {error}"
-            )
+        except BaseException:
+            await pilot.close()
+            raise
 
+        if args.mode == "preflight":
+            await pilot.close()
+            return
 
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--once",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Enable real orders, subject to both environment gates",
-    )
-
-    args = parser.parse_args()
-
-    if args.live and not enabled():
-        parser.error(
-            "Real orders require both "
-            "KALSHI_LIVE_TRADING_ENABLED=true"
+        # Validates API preview only.
+        # Does not establish actual fills or matching rules.
+        pilot.preflight_sides.update(
+            ("yes", "no")
         )
 
-    shadow.ensure_table()
-    ensure_table()
+    original_consider = scan.Engine.consider
 
-    mode = (
-        "REAL ONE-CONTRACT FOK"
-        if args.live
-        else "DRY RUN"
+    def wrapped(
+        engine, kind, legs,
+        extra=None, family=None
+    ):
+        if kind == "CROSS_EXCHANGE":
+            pilot.observe(engine, kind, legs)
+
+        return original_consider(
+            engine, kind, legs, extra, family
+        )
+
+    scan.Engine.consider = wrapped
+
+    scan_args = argparse.Namespace(
+        minutes=args.minutes,
+        log_db=False,
+        extra_kalshi_series=(
+            ["KXTEMPNYCHS", "KXTEMPMIAH"]
+            if args.with_weather else []
+        ),
+        max_extra=12,
+        max_age=args.max_age_ms / 1000,
+        min_qty=D("1"),
+        eval_qty=D(str(args.qty)),
+        min_edge=args.min_net_cents / 100,
+        kalshi_rate=D("0.07"),
+        poly_rate=D("0.0695"),
+        slip=D("0.01"),
+        k_fee=D("0.02"),
+        p_fee=D("0.02"),
+        cooldown=3,
+        status_every=10,
+        close_buffer=5,
+        exhaustive_set=[],
+        exclusive_set=[],
+        no_weather=not args.with_weather,
     )
 
-    print(f"KXBTC15M {mode}")
-    print(
-        "Polling every 5 seconds. "
-        "Settling and reconciling every 60 seconds."
+    note(
+        "READY",
+        mode=args.mode,
+        min_net_cents=str(args.min_net_cents),
+        quantity=args.qty,
+        max_age_ms=args.max_age_ms,
     )
-    print(
-        "Maximum 3 BTC orders/day. "
-        "Daily realized-loss cutoff: $3."
-    )
-
-    seen = set()
-    last_reconcile = 0.0
 
     try:
-        while True:
-            try:
-                poll(args.live, seen)
+        await scan.run(scan_args)
 
-            except Exception as error:
-                print(
-                    f"POLL_ERROR: "
-                    f"{type(error).__name__}: {error}"
-                )
+    finally:
+        scan.Engine.consider = original_consider
 
-            if time.monotonic() - last_reconcile >= 60:
-                try:
-                    shadow.settle()
-                    reconcile()
+        if pilot.pending:
+            await asyncio.gather(
+                *tuple(pilot.pending),
+                return_exceptions=True,
+            )
 
-                except Exception as error:
-                    print(
-                        f"SETTLE_ERROR: "
-                        f"{type(error).__name__}: {error}"
-                    )
-
-                last_reconcile = time.monotonic()
-
-            if args.once:
-                break
-
-            time.sleep(POLL_SECONDS)
-
-    except KeyboardInterrupt:
-        print("Stopped")
+        await pilot.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

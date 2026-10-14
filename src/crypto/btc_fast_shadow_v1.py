@@ -1,0 +1,818 @@
+"""BTC-only Kalshi vs Polymarket US latency/edge research. READ ONLY."""
+
+import argparse
+import asyncio
+import json
+import time
+from collections import Counter, deque
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal as D
+from pathlib import Path
+
+from dotenv import load_dotenv
+from src.crypto import cross_exchange_arb_v2 as scan
+
+# BTC_FAST_TELEMETRY_V2: quote evidence and callback profiling
+
+QTY = (1, 5, 10, 20)
+DELAYS_MS = (5, 25, 50, 100, 250)
+
+
+def emit(kind, **fields):
+    print("BTC_FAST_" + kind + " " + json.dumps(
+        fields, default=str, separators=(",", ":")
+    ), flush=True)
+
+
+class FastBTC:
+    """Only cross-venue K NO + P YES; no order clients or order submission."""
+
+    def __init__(self, state, args):
+        self.state = state
+        self.args = args
+        self.last_top = None
+        self.episode_open = False
+        self.episode_actionable = False
+        self.episodes = 0
+        self.actionable = 0
+        self.top_changes = 0
+        self.non_top_updates = 0
+        self.stale_checks = 0
+        self.probes = Counter()
+        self.best = {}
+        self.tasks = set()
+        self.last_emit = 0.0
+        self.errors = 0
+        self.probe_id = 0
+        self.last_probed_edge = D("-999")
+        self.improvement_probes = 0
+        self.skipped = Counter()
+        self.skipped_peak = None
+        self.check_calls = 0
+        self.check_ms = deque(maxlen=4096)
+
+    def quote(self, now):
+        s = self.state
+        if not s.kalshi_btc or not s.poly_slug:
+            return "NO_PAIR", None
+
+        kb = s.books.get(s.kalshi_btc)
+        pb = s.poly
+
+        if not kb or not kb.ready or not pb.ready:
+            return "NO_BOOK", None
+
+        ka = now - kb.seen
+        pa = now - pb.seen
+
+        if ka < 0 or pa < 0 or max(ka, pa) > self.args.max_age_ms / 1000:
+            return "STALE", {
+                "k_age_ms": round(1000 * ka, 2),
+                "p_age_ms": round(1000 * pa, 2),
+            }
+
+        kb_yes_bid = scan.best(kb.bids["yes"], high=True)
+        poly_yes_ask = scan.best(pb.offers)
+
+        if not kb_yes_bid or not poly_yes_ask:
+            return "NO_SIDE", None
+
+        kp = D(1) - kb_yes_bid[0]
+        kq = kb_yes_bid[1]
+        pp, pq = poly_yes_ask
+
+        return "READY", {
+            "k_price": kp,
+            "p_price": pp,
+            "k_qty": kq,
+            "p_qty": pq,
+            "k_age_ms": round(1000 * ka, 2),
+            "p_age_ms": round(1000 * pa, 2),
+        }
+
+    def net_cents(self, quote, qty):
+        q = D(qty)
+
+        if min(quote["k_qty"], quote["p_qty"]) < q:
+            return None
+
+        k = scan.Leg(
+            "kalshi",
+            self.state.kalshi_btc,
+            "no",
+            quote["k_price"],
+            quote["k_qty"],
+        )
+        p = scan.Leg(
+            "polymarket_us",
+            self.state.poly_slug,
+            "yes",
+            quote["p_price"],
+            quote["p_qty"],
+        )
+
+        fees = (
+            scan.estimate_fee(k, q, self.args)
+            + scan.estimate_fee(p, q, self.args)
+        )
+
+        return (
+            D(1)
+            - k.price
+            - p.price
+            - fees / q
+            - self.args.slip
+        ) * 100
+
+    def check(self, changed=None):
+        self.state.updates += 1
+
+        if changed not in (None, "POLY", self.state.kalshi_btc):
+            return
+
+        if not self.state.close or datetime.now(timezone.utc) >= (
+            self.state.close
+            - timedelta(seconds=self.args.close_buffer)
+        ):
+            self.episode_open = False
+            return
+
+        now = time.monotonic()
+        status, quote = self.quote(now)
+
+        if status != "READY":
+            self.stale_checks += 1
+            self.last_top = None
+            self.episode_open = False
+            self.episode_actionable = False
+            return
+
+        top = (
+            quote["k_price"],
+            quote["k_qty"],
+            quote["p_price"],
+            quote["p_qty"],
+        )
+
+        if top == self.last_top:
+            self.non_top_updates += 1
+            return
+
+        self.last_top = top
+        self.top_changes += 1
+
+        gross = (
+            D(1)
+            - quote["k_price"]
+            - quote["p_price"]
+        ) * 100
+
+        # Skip fee calculations when gross cannot pass the buffer.
+        if gross < self.args.slip * 100 + self.args.research_cents:
+            self.episode_open = False
+            self.episode_actionable = False
+            return
+
+        results = {}
+
+        for qty in QTY:
+            net = self.net_cents(quote, qty)
+
+            if net is None:
+                continue
+
+            results[qty] = net
+
+            if qty not in self.best or net > self.best[qty]:
+                self.best[qty] = net
+
+        research = {
+            q: n
+            for q, n in results.items()
+            if n >= self.args.research_cents
+        }
+
+        actionable = any(
+            n >= self.args.action_cents
+            for n in research.values()
+        )
+
+        if not research:
+            self.episode_open = False
+            self.episode_actionable = False
+            return
+
+        # Probe new episodes, promotions and material improvements.
+        best_edge = max(research.values())
+        new_episode = not self.episode_open
+        promoted = actionable and not self.episode_actionable
+
+        if new_episode:
+            self.episodes += 1
+            self.last_probed_edge = D("-999")
+
+        if promoted:
+            self.actionable += 1
+
+        self.episode_open = True
+        self.episode_actionable = (
+            self.episode_actionable or actionable
+        )
+
+        improvement = (
+            not new_episode
+            and not promoted
+            and best_edge >= self.last_probed_edge + D("0.25")
+        )
+
+        if not (new_episode or promoted or improvement):
+            return
+
+        reason = (
+            "NEW" if new_episode else
+            "PROMOTED" if promoted else "IMPROVED_EDGE"
+        )
+
+        large_jump = (
+            improvement
+            and best_edge >= self.last_probed_edge + D("1.0")
+        )
+        spacing = 0 if large_jump else 0.02
+
+        blocked = (
+            "RATE_LIMIT" if now - self.last_emit < spacing else
+            "TASK_LIMIT" if len(self.tasks) >= 8 else
+            "PROBE_CAP" if self.probe_id >= 300 else None
+        )
+
+        if blocked:
+            self.skipped[blocked] += 1
+            if self.skipped_peak is None or best_edge > self.skipped_peak:
+                self.skipped_peak = best_edge
+            return
+
+        self.last_emit = now
+        self.last_probed_edge = best_edge
+        self.improvement_probes += int(reason == "IMPROVED_EDGE")
+        self.probe_id += 1
+
+        seq = self.probe_id
+        start = time.monotonic()
+        poly_seen_at_signal = self.state.poly.seen
+
+        task = asyncio.create_task(
+            self.probe(
+                self.episodes,
+                seq,
+                start,
+                quote,
+                tuple(research),
+                poly_seen_at_signal,
+            )
+        )
+
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+        emit(
+            "SIGNAL",
+            episode=self.episodes,
+            probe_id=seq,
+            reason=reason,
+            best_net_cents=str(best_edge),
+            promoted=promoted,
+            k_no=str(quote["k_price"]),
+            p_yes=str(quote["p_price"]),
+            gross_cents=str(gross),
+            net_cents={
+                str(q): str(n)
+                for q, n in research.items()
+            },
+            k_age_ms=quote["k_age_ms"],
+            p_age_ms=quote["p_age_ms"],
+            executable=False,
+            rule_equivalence_unverified=True,
+        )
+
+    async def probe(
+        self, episode, probe_id, start, entry, sizes,
+        poly_seen_at_signal,
+    ):
+        rows = {}
+
+        try:
+            for delay in DELAYS_MS:
+                await asyncio.sleep(
+                    max(
+                        0,
+                        start + delay / 1000
+                        - time.monotonic(),
+                    )
+                )
+
+                now = time.monotonic()
+                elapsed_ms = (now - start) * 1000
+                status, q = self.quote(now)
+
+                statuses = {}
+
+                for size in sizes:
+                    if status != "READY":
+                        reason = status
+
+                    elif (
+                        q["k_price"] > entry["k_price"]
+                        or q["p_price"] > entry["p_price"]
+                    ):
+                        reason = "WORSE_PRICE"
+
+                    elif min(q["k_qty"], q["p_qty"]) < D(size):
+                        reason = "LOW_DEPTH"
+
+                    elif (
+                        q["k_price"] < entry["k_price"]
+                        or q["p_price"] < entry["p_price"]
+                    ):
+                        reason = "IMPROVED"
+                    elif self.state.poly.seen > poly_seen_at_signal:
+                        # Poly full-book frame reaffirmed its ask;
+                        # Kalshi's bid remains locally observed only.
+                        reason = "POLY_REAFFIRMED"
+                    else:
+                        reason = "LOCAL_UNCHANGED"
+
+                    statuses[str(size)] = reason
+                    self.probes[(size, delay, reason)] += 1
+
+                rows[str(delay)] = {
+                    "actual_ms": round(elapsed_ms, 2),
+                    "late_ms": round(
+                        max(0, elapsed_ms - delay), 2
+                    ),
+                    "statuses": statuses,
+                    "k_age_ms": (
+                        q.get("k_age_ms") if q else None
+                    ),
+                    "p_age_ms": (
+                        q.get("p_age_ms") if q else None
+                    ),
+                }
+
+            emit(
+                "PROBE",
+                episode=episode,
+                probe_id=probe_id,
+                observations=rows,
+            )
+
+        except Exception as exc:
+            self.errors += 1
+            emit(
+                "PROBE_ERROR",
+                episode=episode,
+                probe_id=probe_id,
+                error=type(exc).__name__,
+            )
+
+    async def jitter(self):
+        samples = []
+        last = time.monotonic()
+        deadline = last + 30
+
+        while True:
+            await asyncio.sleep(0.02)
+            now = time.monotonic()
+
+            samples.append(
+                max(0, (now - last - 0.02) * 1000)
+            )
+            last = now
+
+            if now >= deadline:
+                ordered = sorted(samples)
+
+                emit(
+                    "SCHEDULER",
+                    samples=len(ordered),
+                    p50_ms=round(
+                        ordered[len(ordered) // 2], 2
+                    ),
+                    p95_ms=round(
+                        ordered[
+                            int(.95 * (len(ordered) - 1))
+                        ], 2
+                    ),
+                    max_ms=round(ordered[-1], 2),
+                )
+
+                samples.clear()
+                deadline = now + 30
+
+    async def finish(self):
+        if self.tasks:
+            await asyncio.gather(
+                *tuple(self.tasks),
+                return_exceptions=True,
+            )
+
+        measurements = sorted(self.check_ms)
+
+        def percentile(frac):
+            if not measurements:
+                return None
+            return round(
+                measurements[int(frac * (len(measurements) - 1))],
+                4,
+            )
+
+        emit(
+            "WINDOW_SUMMARY",
+            close=str(self.state.close),
+            episodes=self.episodes,
+            actionable_episodes=self.actionable,
+            top_changes=self.top_changes,
+            non_top_updates=self.non_top_updates,
+            stale_checks=self.stale_checks,
+            errors=self.errors,
+            probes_launched=self.probe_id,
+            improved_edge_probes=self.improvement_probes,
+            probe_skips=dict(self.skipped),
+            largest_skipped_net_cents=(
+                str(self.skipped_peak)
+                if self.skipped_peak is not None else None
+            ),
+            callback_processing_ms={
+                "calls": self.check_calls,
+                "sampled_every": 32,
+                "samples": len(measurements),
+                "p50": percentile(0.50),
+                "p95": percentile(0.95),
+                "p99": percentile(0.99),
+                "max": percentile(1.0),
+            },
+            best_net_cents={
+                str(k): str(v)
+                for k, v in self.best.items()
+            },
+            probes={
+                f"Q{q}_{ms}ms_{status}": count
+                for (q, ms, status), count
+                in sorted(self.probes.items())
+            },
+            kalshi_messages=self.state.kalshi_messages,
+            polymarket_frames=self.state.poly_messages,
+            orders_submitted=0,
+        )
+
+
+async def self_test(args):
+    k = scan.KalshiBook()
+
+    k.apply(
+        "orderbook_snapshot",
+        {
+            "yes_dollars_fp": [["0.56", "40"]],
+            "no_dollars_fp": [["0.45", "40"]],
+        },
+    )
+
+    p = scan.PolyBook()
+
+    p.apply({
+        "state": "MARKET_STATE_OPEN",
+        "bids": [{
+            "px": {"value": "0.49"},
+            "qty": "40",
+        }],
+        "offers": [{
+            "px": {"value": "0.51"},
+            "qty": "40",
+        }],
+    })
+
+    s = scan.State(
+        metadata={"TEST": {}},
+        books={"TEST": k},
+        kalshi_btc="TEST",
+        poly_slug="TEST_POLY",
+        poly=p,
+        close=(
+            datetime.now(timezone.utc)
+            + timedelta(minutes=15)
+        ),
+    )
+
+    engine = FastBTC(s, args)
+    status, q = engine.quote(time.monotonic())
+
+    assert status == "READY"
+    assert q["k_price"] == D(".44")
+    assert q["p_price"] == D(".51")
+    assert engine.net_cents(q, 10) is not None
+
+    engine.check("TEST")
+
+    assert engine.episodes == 1
+    assert engine.actionable == 1
+
+    await asyncio.sleep(.28)
+
+    assert engine.probes[
+        (10, 5, "LOCAL_UNCHANGED")
+    ] == 1
+
+    # Improve the price inside the same episode.
+    k.apply("orderbook_snapshot", {
+        "yes_dollars_fp": [["0.56", "40"]],
+        "no_dollars_fp": [["0.45", "40"]],
+    })
+    p.apply({
+        "state": "MARKET_STATE_OPEN",
+        "bids": [{"px": {"value": "0.49"}, "qty": "40"}],
+        "offers": [{"px": {"value": "0.50"}, "qty": "40"}],
+    })
+    engine.check("POLY")
+
+    assert engine.probe_id == 2
+    assert engine.improvement_probes == 1
+
+    await engine.finish()
+    print(
+        "PASS: BTC-only shadow self-test; "
+        "no orders submitted."
+    )
+
+
+async def run(args):
+    load_dotenv(
+        Path(__file__).resolve().parents[2] / ".env"
+    )
+
+    if args.self_test:
+        return await self_test(args)
+
+    deadline = time.monotonic() + args.minutes * 60
+
+    emit(
+        "START",
+        mode="SHADOW_ONLY",
+        duration_minutes=args.minutes,
+        research_cents=str(args.research_cents),
+        action_cents=str(args.action_cents),
+        max_age_ms=args.max_age_ms,
+        quantities=QTY,
+        delays_ms=DELAYS_MS,
+        orders_submitted=0,
+    )
+
+    discovered = argparse.Namespace(
+        extra_kalshi_series=[],
+        max_extra=1,
+    )
+
+    while time.monotonic() < deadline:
+        try:
+            metadata, btc, poly, close = (
+                await asyncio.to_thread(
+                    scan.discover,
+                    discovered,
+                )
+            )
+
+        except Exception as exc:
+            emit(
+                "DISCOVERY_ERROR",
+                error=type(exc).__name__,
+            )
+            await asyncio.sleep(3)
+            continue
+
+        if not btc or not poly:
+            emit(
+                "WAIT_MARKET",
+                kalshi_found=bool(btc),
+                poly_found=bool(poly),
+            )
+
+            await asyncio.sleep(
+                min(
+                    5,
+                    max(0, deadline - time.monotonic()),
+                )
+            )
+            continue
+
+        state = scan.State(
+            metadata={btc: metadata[btc]},
+            kalshi_btc=btc,
+            poly_slug=poly,
+            close=close,
+            pair_status=(
+                "WINDOW_MATCH_ONLY_RULES_UNVERIFIED"
+            ),
+        )
+
+        engine = FastBTC(state, args)
+        original_check = engine.check
+
+        def measured_check(changed=None):
+            started = time.perf_counter_ns()
+            try:
+                return original_check(changed)
+            finally:
+                engine.check_calls += 1
+                if engine.check_calls % 32 == 0:
+                    engine.check_ms.append(
+                        (time.perf_counter_ns() - started) / 1e6
+                    )
+
+        engine.check = measured_check
+
+        feeds = [
+            asyncio.create_task(
+                scan.kalshi_stream(state, engine)
+            ),
+            asyncio.create_task(
+                scan.poly_stream(state, engine)
+            ),
+        ]
+
+        jitter = asyncio.create_task(
+            engine.jitter()
+        )
+
+        emit(
+            "WINDOW",
+            kalshi=btc,
+            polymarket_us=poly,
+            close=close,
+            rule_match="UNVERIFIED",
+        )
+
+        next_status = time.monotonic() + 30
+
+        try:
+            while (
+                time.monotonic() < deadline
+                and datetime.now(timezone.utc) < (
+                    close
+                    - timedelta(
+                        seconds=args.close_buffer
+                    )
+                )
+            ):
+                await asyncio.sleep(.2)
+
+                if time.monotonic() >= next_status:
+                    next_status = time.monotonic() + 30
+
+                    k_age = (
+                        round(
+                            (
+                                time.monotonic()
+                                - state.books[btc].seen
+                            ) * 1000,
+                            1,
+                        )
+                        if (
+                            btc in state.books
+                            and state.books[btc].ready
+                        )
+                        else None
+                    )
+
+                    p_age = (
+                        round(
+                            (
+                                time.monotonic()
+                                - state.poly.seen
+                            ) * 1000,
+                            1,
+                        )
+                        if state.poly.ready
+                        else None
+                    )
+
+                    emit(
+                        "HEARTBEAT",
+                        episodes=engine.episodes,
+                        actionable=engine.actionable,
+                        top_changes=engine.top_changes,
+                        kalshi_messages=(
+                            state.kalshi_messages
+                        ),
+                        polymarket_frames=(
+                            state.poly_messages
+                        ),
+                        k_age_ms=k_age,
+                        p_age_ms=p_age,
+                    )
+
+        finally:
+            for task in feeds:
+                task.cancel()
+
+            jitter.cancel()
+
+            await asyncio.gather(
+                *feeds,
+                jitter,
+                return_exceptions=True,
+            )
+
+            await engine.finish()
+
+        # Avoid repeated reconnects in the close buffer.
+        wait = max(
+            0,
+            (
+                close - datetime.now(timezone.utc)
+            ).total_seconds() + 0.2,
+        )
+
+        if wait:
+            await asyncio.sleep(
+                min(
+                    wait,
+                    max(
+                        0,
+                        deadline - time.monotonic(),
+                    ),
+                )
+            )
+
+    emit("DONE", orders_submitted=0)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument(
+        "--minutes",
+        type=float,
+        default=15,
+    )
+    ap.add_argument(
+        "--max-age-ms",
+        type=float,
+        default=100,
+    )
+    ap.add_argument(
+        "--research-cents",
+        type=D,
+        default=D("0.10"),
+    )
+    ap.add_argument(
+        "--action-cents",
+        type=D,
+        default=D("0.50"),
+    )
+    ap.add_argument(
+        "--slip",
+        type=D,
+        default=D("0.01"),
+    )
+    ap.add_argument(
+        "--kalshi-rate",
+        type=D,
+        default=D("0.07"),
+    )
+    ap.add_argument(
+        "--poly-rate",
+        type=D,
+        default=D("0.0695"),
+    )
+    ap.add_argument(
+        "--close-buffer",
+        type=float,
+        default=5,
+    )
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+    )
+
+    args = ap.parse_args()
+
+    if (
+        not 0 < args.minutes <= 240
+        or args.max_age_ms <= 0
+        or min(
+            args.research_cents,
+            args.action_cents,
+            args.slip,
+            args.kalshi_rate,
+            args.poly_rate,
+        ) < 0
+        or args.research_cents > args.action_cents
+    ):
+        ap.error("Invalid parameters")
+
+    try:
+        asyncio.run(run(args))
+    except KeyboardInterrupt:
+        emit("STOPPED", orders_submitted=0)
+
+
+if __name__ == "__main__":
+    main()

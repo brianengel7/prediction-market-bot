@@ -1,0 +1,446 @@
+import asyncio
+import json
+import time
+from decimal import Decimal as D
+
+
+class ExecutionReadinessAudit:
+    """Read-only prospective cross-exchange quote-survival audit."""
+
+    DELAYS = (0.05, 0.10, 0.25)
+    MAX_TRACK_SECONDS = 5.0
+
+    def __init__(self, engine, price_fn):
+        self.engine = engine
+        self.price_fn = price_fn
+        self.active = {}
+        self.last_seen_top = {}
+        self.next_id = 0
+        self.completed = 0
+        self.survivors = {50: 0, 100: 0, 250: 0}
+        self.best_net = None
+
+    def _ages(self):
+        state = self.engine.state
+        now = time.monotonic()
+
+        kbook = (
+            state.books.get(state.kalshi_btc)
+            if state.kalshi_btc else None
+        )
+        pbook = state.poly if state.poly_slug else None
+
+        def age(book):
+            if book is None or not getattr(book, "ready", False):
+                return None
+            seen = getattr(book, "seen", None)
+            if seen is None:
+                return None
+            return round(max(0, (now - seen) * 1000), 2)
+
+        return {
+            "kalshi_book_age_ms": age(kbook),
+            "poly_book_age_ms": age(pbook),
+        }
+
+    def _top_age(self, legs, now=None):
+        """Lower-bound age of an unchanged observed top-of-book."""
+        now = time.monotonic() if now is None else now
+        result = {}
+
+        for leg in legs or []:
+            if leg is None:
+                continue
+
+            key = (leg.venue, leg.ticker, leg.side)
+            signature = (str(leg.price), str(leg.size))
+            previous = self.last_seen_top.get(key)
+
+            if previous is None or previous[0] != signature:
+                previous = (signature, now)
+                self.last_seen_top[key] = previous
+
+            result[f"{leg.venue}_{leg.side}"] = round(
+                (now - previous[1]) * 1000, 2
+            )
+
+        return result
+
+    def _read_legs(self, episode):
+        state = self.engine.state
+        args = self.engine.args
+
+        book = state.books.get(episode["kalshi_market"])
+        if book is None or not state.poly_slug:
+            return None
+
+        try:
+            return [
+                book.ask(
+                    episode["kalshi_market"],
+                    episode["kalshi_side"],
+                    args.max_age,
+                ),
+                state.poly.ask(
+                    episode["poly_market"],
+                    episode["poly_side"],
+                    args.max_age,
+                ),
+            ]
+        except Exception:
+            return None
+
+    def _price_now(self, episode):
+        state = self.engine.state
+
+        if (
+            state.kalshi_btc != episode["kalshi_market"]
+            or state.poly_slug != episode["poly_market"]
+        ):
+            return None, "ROLLOVER"
+
+        legs = self._read_legs(episode)
+
+        if legs is None:
+            return None, "MISSING_BOOK"
+
+        try:
+            row = self.price_fn(
+                "CROSS_EXCHANGE",
+                legs,
+                self.engine.args,
+                {"rule_match": state.pair_status},
+            )
+        except Exception as exc:
+            return None, f"REPRICE_ERROR_{type(exc).__name__}"
+
+        if row is None:
+            return None, "NO_FRESH_EXECUTABLE_PAIR"
+
+        return row, "OK"
+
+    def _snapshot(self, episode, target_ms):
+        row, status = self._price_now(episode)
+
+        elapsed = (
+            time.monotonic() - episode["started_mono"]
+        ) * 1000
+
+        result = {
+            "target_ms": target_ms,
+            "actual_elapsed_ms": round(elapsed, 2),
+            "sample_lateness_ms": round(
+                max(0, elapsed - target_ms), 2
+            ),
+            "book_age_proxy_ms": self._ages(),
+            "status": status,
+            "prices": None,
+            "gross_cents": None,
+            "net_est_cents": None,
+            "evaluated_pairs": None,
+            "same_quantity_available": False,
+            "net_positive_at_same_quantity": False,
+        }
+
+        if row is not None:
+            quantity = D(row["evaluated_pairs"])
+            net = D(row["buffered_cents_per_pair"])
+
+            enough = (
+                quantity >= D(episode["initial_quantity"])
+            )
+
+            result.update({
+                "prices": row["legs"],
+                "gross_cents": row["gross_cents_per_pair"],
+                "net_est_cents": row["buffered_cents_per_pair"],
+                "evaluated_pairs": row["evaluated_pairs"],
+                "same_quantity_available": enough,
+                "net_positive_at_same_quantity": bool(
+                    enough and net > 0
+                ),
+                "top_unchanged_ms_lower_bound": self._top_age(
+                    self._read_legs(episode)
+                ),
+            })
+
+        return result
+
+    def observe(self, key, kind, legs, row):
+        if kind != "CROSS_EXCHANGE":
+            return
+
+        now = time.monotonic()
+        top_ages = self._top_age(legs, now)
+        current = self.active.get(key)
+
+        positive = (
+            row is not None
+            and D(row["buffered_cents_per_pair"]) > 0
+        )
+
+        if not positive:
+            if current is not None:
+                self._end(
+                    current,
+                    "NET_NONPOSITIVE_OR_MISSING",
+                    now,
+                )
+            return
+
+        if current is not None:
+            if (
+                D(row["evaluated_pairs"])
+                < D(current["initial_quantity"])
+            ):
+                self._end(current, "ORIGINAL_DEPTH_LOST", now)
+            else:
+                net = D(row["buffered_cents_per_pair"])
+                if net > D(current["best_net_cents"]):
+                    current["best_net_cents"] = str(net)
+                    current["best_prices"] = row["legs"]
+                return
+
+        if len(legs) != 2 or any(x is None for x in legs):
+            return
+
+        ages = self._ages()
+
+        if any(value is None for value in ages.values()):
+            return
+
+        self.next_id += 1
+
+        episode = {
+            "id": self.next_id,
+            "key": key,
+            "started_mono": now,
+            "started_at": row["at"],
+            "kalshi_market": legs[0].ticker,
+            "poly_market": legs[1].ticker,
+            "kalshi_side": legs[0].side,
+            "poly_side": legs[1].side,
+            "initial_quantity": row["evaluated_pairs"],
+            "start_row": dict(row),
+            "start_ages_ms": ages,
+            "start_top_age_ms": top_ages,
+            "best_net_cents": row["buffered_cents_per_pair"],
+            "best_prices": row["legs"],
+            "end_mono": None,
+            "end_reason": None,
+            "samples": {},
+        }
+
+        self.active[key] = episode
+
+        print(
+            f"READINESS_START id={episode['id']} "
+            f"{key} "
+            f"net={episode['best_net_cents']}c "
+            f"qty={episode['initial_quantity']} "
+            f"K_age={ages['kalshi_book_age_ms']}ms "
+            f"P_age={ages['poly_book_age_ms']}ms",
+            flush=True,
+        )
+
+        asyncio.create_task(self._watch(episode))
+
+    def _end(self, episode, reason, now=None):
+        if episode["end_mono"] is not None:
+            return
+
+        episode["end_mono"] = (
+            time.monotonic() if now is None else now
+        )
+        episode["end_reason"] = reason
+
+        if self.active.get(episode["key"]) is episode:
+            self.active.pop(episode["key"])
+
+    async def _watch(self, episode):
+        try:
+            for delay in self.DELAYS:
+                target = (
+                    episode["started_mono"] + delay
+                )
+
+                await asyncio.sleep(
+                    max(0, target - time.monotonic())
+                )
+
+                ms = round(delay * 1000)
+
+                sample = self._snapshot(episode, ms)
+                episode["samples"][str(ms)] = sample
+
+                if (
+                    episode["end_mono"] is None
+                    and not sample[
+                        "net_positive_at_same_quantity"
+                    ]
+                ):
+                    self._end(
+                        episode,
+                        "DELAY_SAMPLE_EXIT",
+                    )
+
+            while episode["end_mono"] is None:
+                elapsed = (
+                    time.monotonic()
+                    - episode["started_mono"]
+                )
+
+                if elapsed >= self.MAX_TRACK_SECONDS:
+                    self._end(
+                        episode,
+                        "CENSORED_AT_5S",
+                    )
+                    break
+
+                await asyncio.sleep(0.05)
+
+                row, reason = self._price_now(episode)
+
+                if row is None:
+                    self._end(
+                        episode,
+                        "WATCHDOG_" + reason,
+                    )
+                elif (
+                    D(row["buffered_cents_per_pair"]) <= 0
+                    or D(row["evaluated_pairs"])
+                    < D(episode["initial_quantity"])
+                ):
+                    self._end(
+                        episode,
+                        "WATCHDOG_SPREAD_OR_DEPTH_LOST",
+                    )
+
+            await self._finish(episode)
+
+        except asyncio.CancelledError:
+            self._end(episode, "CANCELLED")
+            raise
+
+        except Exception as exc:
+            self._end(episode, "AUDIT_ERROR")
+            print(
+                f"READINESS_ERROR "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    async def _finish(self, episode):
+        duration_ms = round(
+            (
+                episode["end_mono"]
+                - episode["started_mono"]
+            ) * 1000,
+            2,
+        )
+
+        results = {}
+
+        for ms in (50, 100, 250):
+            sample = episode["samples"].get(str(ms), {})
+
+            # A materially delayed timer cannot establish
+            # survival at its nominal observation horizon.
+            on_time = (
+                sample.get("sample_lateness_ms", 1e9)
+                <= 25
+            )
+
+            survived = bool(
+                duration_ms >= ms
+                and on_time
+                and sample.get(
+                    "net_positive_at_same_quantity",
+                    False,
+                )
+            )
+
+            results[str(ms)] = {
+                "survived": survived,
+                "sample_on_time": on_time,
+            }
+
+            if survived:
+                self.survivors[ms] += 1
+
+        record = dict(episode["start_row"])
+        record["kind"] = "EXECUTION_READINESS"
+
+        record["readiness"] = {
+            "episode_id": episode["id"],
+            "direction": episode["key"],
+            "start_time": episode["started_at"],
+            "duration_ms_observed_proxy": duration_ms,
+            "end_reason": episode["end_reason"],
+            "start_book_age_proxy_ms": episode[
+                "start_ages_ms"
+            ],
+            "start_top_unchanged_ms_lower_bound": episode[
+                "start_top_age_ms"
+            ],
+            "initial_quantity": episode[
+                "initial_quantity"
+            ],
+            "start_prices": episode[
+                "start_row"
+            ]["legs"],
+            "best_net_est_cents": episode[
+                "best_net_cents"
+            ],
+            "best_prices": episode["best_prices"],
+            "delay_results": results,
+            "delay_snapshots": episode["samples"],
+            "execution_verified": False,
+            "settlement_equivalence_verified": False,
+            "orders_submitted": 0,
+        }
+
+        self.completed += 1
+        best = D(episode["best_net_cents"])
+
+        if self.best_net is None or best > self.best_net:
+            self.best_net = best
+
+        print(
+            f"READINESS_END id={episode['id']} "
+            f"{episode['key']} "
+            f"duration~{duration_ms:.1f}ms "
+            f"best_net={best:+.3f}c "
+            f"50ms={results['50']['survived']} "
+            f"100ms={results['100']['survived']} "
+            f"250ms={results['250']['survived']} "
+            f"reason={episode['end_reason']}",
+            flush=True,
+        )
+
+        print(
+            "READINESS_JSON "
+            + json.dumps(
+                record["readiness"],
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+
+        # Reuse the current v2.1 asynchronous signal logger.
+        # Full readiness detail is always printed above,
+        # regardless of the database writer's JSON schema.
+        self.engine._queue(record)
+
+    def print_summary(self):
+        print(
+            f"READINESS_SUMMARY "
+            f"completed={self.completed} "
+            f"active={len(self.active)} "
+            f"survive_50ms={self.survivors[50]} "
+            f"survive_100ms={self.survivors[100]} "
+            f"survive_250ms={self.survivors[250]} "
+            f"best_net_est="
+            f"{self.best_net if self.best_net is not None else 'none'}c",
+            flush=True,
+        )
