@@ -153,6 +153,7 @@ class KalshiOrders:
 
         body = {
             "ticker": ticker,
+            "exchange_index": 2,
             "side": "bid" if side == "yes" else "ask",
             "count": f"{D(quantity):.2f}",
             "price": f"{yes_price:.4f}",
@@ -957,7 +958,9 @@ class Pilot:
         elif self.preview_count >= a.max_previews:
             return
 
-        if now - self.last_preview_time < 3:
+        # LIVE_HOTPATH_TRIM_V1
+        # Keep preview throttling; never throttle live signals.
+        if a.mode != "live" and now - self.last_preview_time < 3:
             return
 
         record = scan.priced_spread(
@@ -1683,6 +1686,12 @@ async def main():
     ):
         if kind == "CROSS_EXCHANGE":
             pilot.observe(engine, kind, legs)
+
+        # LIVE_HOTPATH_TRIM_V1
+        # Skip research calculations and audits in live mode.
+        # Pilot.observe has already checked trading signals.
+        if args.mode == "live":
+            return None
 
         return original_consider(
             engine, kind, legs, extra, family
