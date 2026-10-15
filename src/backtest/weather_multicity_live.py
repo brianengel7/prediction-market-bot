@@ -1552,7 +1552,7 @@ async def main():
         return
 
     live = os.getenv(
-        "LIVE_TRADING_ENABLED",
+        "KALSHI_LIVE_TRADING_ENABLED",
         "",
     ).strip().lower() in (
         "1",

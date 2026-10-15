@@ -1,0 +1,28 @@
+{
+  "single_attempt_claimed": true,
+  "attempts": [
+    {
+      "id": "e1e5eded-35e7-4998-9e4f-6ea7ffea715c",
+      "key": "SEA:KXHIGHTSEA-26OCT15",
+      "timestamp": "2026-10-15T16:11:24.728748-04:00",
+      "mode": "one-trade",
+      "legs": [
+        "KXHIGHTSEA-26OCT15-B68.5",
+        "KXHIGHTSEA-26OCT15-B70.5"
+      ],
+      "qty": 1,
+      "asks": [
+        "0.3000",
+        "0.4800"
+      ],
+      "status": "COMPLETE",
+      "first_client_id": "f83367ba-b59f-41fc-b79a-93dcdaa8e5f1",
+      "first_order_id": "01a14130-dde0-75c7-b448-184fe20fffeb",
+      "first_filled": true,
+      "second_client_id": "12452a43-a0a0-4581-83d2-de1f7d9b4599",
+      "second_order_id": "01a14130-dde0-72fb-baa5-e5768ed2c583",
+      "second_filled": true,
+      "complete": true
+    }
+  ]
+}
