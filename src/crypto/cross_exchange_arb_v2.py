@@ -558,6 +558,9 @@ class Engine:
         extra=None,
         family=None,
     ):
+        # FAST_EXECUTION_ONLY_OPT_V1
+        if getattr(self.args, "execution_only", False):
+            return
         row = priced_spread(
             kind, legs, self.args, extra
         )

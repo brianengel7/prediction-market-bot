@@ -153,6 +153,7 @@ class KalshiOrders:
 
         body = {
             "ticker": ticker,
+            "exchange_index": 2,
             "side": "bid" if side == "yes" else "ask",
             "count": f"{D(quantity):.2f}",
             "price": f"{yes_price:.4f}",
@@ -957,7 +958,8 @@ class Pilot:
         elif self.preview_count >= a.max_previews:
             return
 
-        if now - self.last_preview_time < 3:
+        # FAST_EXECUTION_ONLY_OPT_V1
+        if a.mode != "live" and now - self.last_preview_time < 3:
             return
 
         record = scan.priced_spread(
@@ -1175,26 +1177,7 @@ class Pilot:
                 f.flush()
                 os.fsync(f.fileno())
 
-            note(
-                "SUBMITTING",
-                pair=pair,
-                submitted_limit_prices=[
-                    str(k_leg.price),
-                    str(p_leg.price),
-                ],
-                client_id=client_id,
-                qty=a.qty,
-                observed_to_submit_ms=round(
-                    (
-                        time.perf_counter_ns()
-                        - detected_ns
-                    ) / 1e6,
-                    2,
-                ),
-                net_est_cents=latest[
-                    "buffered_cents_per_pair"
-                ],
-            )
+            dispatch_ns = time.perf_counter_ns()
 
             # Concurrent FOK is NOT atomic.
             k_result, p_result = await asyncio.gather(
@@ -1207,6 +1190,24 @@ class Pilot:
                     str(p_leg.price), a.qty,
                 ),
                 return_exceptions=True,
+            )
+
+            # Deferred submission logging.
+            note(
+                "SUBMITTING",
+                pair=pair,
+                submitted_limit_prices=[
+                    str(k_leg.price), str(p_leg.price),
+                ],
+                client_id=client_id,
+                qty=a.qty,
+                observed_to_submit_ms=round(
+                    (dispatch_ns - detected_ns) / 1e6, 2
+                ),
+                net_est_cents=latest[
+                    "buffered_cents_per_pair"
+                ],
+                logged_after_order_responses=True,
             )
 
             note(
@@ -1712,6 +1713,7 @@ async def main():
         close_buffer=5,
         exhaustive_set=[],
         exclusive_set=[],
+        execution_only=(args.mode == "live"),
         no_weather=not args.with_weather,
     )
 
