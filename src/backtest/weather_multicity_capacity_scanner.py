@@ -756,7 +756,7 @@ def activation_schedule(codes):
         local_now = datetime.now(timezone)
 
         local_gate = local_now.replace(
-            hour=13,
+            hour=14,
             minute=0,
             second=0,
             microsecond=0,
