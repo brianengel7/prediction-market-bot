@@ -1502,20 +1502,63 @@ def self_test():
     )
 
 
+import fcntl
+
+_LOCK_FD = None
+
+
 def claim_process_lock():
+    """Hold an exclusive Linux process lock until exit."""
+    global _LOCK_FD
+
+    if _LOCK_FD is not None:
+        raise RuntimeError(
+            "Process lock already held in this interpreter"
+        )
+
     fd = os.open(
         LOCK_FILE,
-        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        os.O_CREAT | os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
 
-    with os.fdopen(fd, "w") as handle:
-        handle.write(
+    try:
+        try:
+            fcntl.flock(
+                fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "Another weather live bot is already running"
+            ) from exc
+
+        # PID is diagnostic information only.
+        # The kernel manages the actual lock.
+        message = (
             f"pid={os.getpid()} "
             f"started={datetime.now(ET).isoformat()}\n"
         )
-        handle.flush()
-        os.fsync(handle.fileno())
+
+        os.ftruncate(fd, 0)
+        os.write(fd, message.encode())
+        os.fsync(fd)
+
+    except BaseException:
+        os.close(fd)
+        raise
+
+    _LOCK_FD = fd
+
+
+def release_process_lock():
+    """Release the lock by closing its file descriptor."""
+    global _LOCK_FD
+
+    if _LOCK_FD is not None:
+        os.close(_LOCK_FD)
+        _LOCK_FD = None
 
 
 async def main():
@@ -1754,7 +1797,7 @@ async def main():
             await api.close()
 
     finally:
-        LOCK_FILE.unlink(missing_ok=True)
+        release_process_lock()
 
 
 if __name__ == "__main__":
