@@ -503,31 +503,21 @@ class Journal:
 
         os.replace(temporary, STATE_FILE)
 
-    def reserve(self, op, *, one_trade):
-        if (
-            one_trade
-            and self.data.get("single_attempt_claimed")
-        ):
+
+    def reserve(self, op, *, one_trade, args):
+        reason = self.entry_block_reason(op, args)
+
+        if reason is not None:
             raise RuntimeError(
-                "One-trade attempt already consumed"
+                f"Entry blocked: {reason}"
             )
 
-        if any(
-            a.get("key") == op.key
-            for a in self.data["attempts"]
-        ):
-            raise RuntimeError(
-                f"Already attempted event {op.key}"
-            )
-
-        record = {
+        rec = {
             "id": str(uuid.uuid4()),
             "key": op.key,
             "timestamp": datetime.now(ET).isoformat(),
             "mode": (
-                "one-trade"
-                if one_trade
-                else "normal"
+                "one-trade" if one_trade else "normal"
             ),
             "legs": list(op.legs),
             "qty": op.qty,
@@ -535,15 +525,14 @@ class Journal:
             "status": "RESERVED",
         }
 
-        self.data["attempts"].append(record)
+        self.data["attempts"].append(rec)
 
         if one_trade:
             self.data["single_attempt_claimed"] = True
 
-        # Persist before any order submission.
+        # Save BEFORE any request reaches Kalshi.
         self.write()
-
-        return record
+        return rec
 
     def update(self, record, status, **extras):
         record.update(
@@ -552,11 +541,77 @@ class Journal:
         )
         self.write()
 
-    def tried(self, key):
-        return any(
-            a.get("key") == key
+
+    def city_attempts_today(self, city):
+        today = datetime.now(ET).date().isoformat()
+        prefix = city + ":"
+
+        return [
+            a for a in self.data["attempts"]
+            if a.get("timestamp", "")[:10] == today
+            and a.get("key", "").startswith(prefix)
+        ]
+
+    def remaining_city_event_pairs(
+        self, city, event, limit
+    ):
+        key = f"{city}:{event}"
+
+        held = sum(
+            int(a.get("qty", 0))
             for a in self.data["attempts"]
+            if a.get("key") == key
+            and a.get("status") == "COMPLETE"
         )
+
+        return max(0, limit - held)
+
+    def entry_block_reason(self, op, args):
+        if (
+            args.one_trade
+            and self.data.get("single_attempt_claimed")
+        ):
+            return "one-trade already used"
+
+        if (
+            self.attempts_today()
+            >= args.max_daily_attempts
+        ):
+            return "global daily attempt cap"
+
+        city_attempts = self.city_attempts_today(
+            op.city
+        )
+
+        if len(city_attempts) >= args.max_city_attempts:
+            return "city daily attempt cap"
+
+        remaining = self.remaining_city_event_pairs(
+            op.city,
+            op.event,
+            args.max_city_event_pairs,
+        )
+
+        if op.qty > remaining:
+            return "city/event cumulative pair cap"
+
+        if city_attempts:
+            recent = max(
+                datetime.fromisoformat(a["timestamp"])
+                for a in city_attempts
+            )
+
+            age = (
+                datetime.now(ET) - recent
+            ).total_seconds()
+
+            if (
+                age
+                < args.city_cooldown_minutes * 60
+            ):
+                return "city entry cooldown"
+
+        return None
 
     def attempts_today(self):
         today = datetime.now(ET).date().isoformat()
@@ -661,7 +716,7 @@ async def execute(
         books,
         tickers,
         one_trade=args.one_trade,
-        max_pairs=args.max_pairs,
+        max_pairs=min(args.max_pairs, journal.remaining_city_event_pairs(op.city, op.event, args.max_city_event_pairs)),
         max_cost=args.max_cost,
     )
 
@@ -708,7 +763,7 @@ async def execute(
 
     record = journal.reserve(
         op,
-        one_trade=args.one_trade,
+        one_trade=args.one_trade, args=args,
     )
 
     log(
@@ -1248,9 +1303,11 @@ async def ws_session(
                     cities[code]
                 )
 
-                if journal.tried(
-                    f"{code}:{event}"
-                ):
+                if len(journal.city_attempts_today(code)) >= args.max_city_attempts:
+                    continue
+                if journal.remaining_city_event_pairs(
+                    code, event, args.max_city_event_pairs
+                ) < 1:
                     continue
 
                 if (
@@ -1265,18 +1322,18 @@ async def ws_session(
                     books,
                     market_tickers,
                     one_trade=args.one_trade,
-                    max_pairs=args.max_pairs,
+                    max_pairs=min(args.max_pairs, journal.remaining_city_event_pairs(code, event, args.max_city_event_pairs)),
                     max_cost=args.max_cost,
                 )
 
-                if opportunity:
+                if opportunity and (not live or journal.entry_block_reason(opportunity, args) is None):
                     identity = (
                         opportunity.legs,
                         opportunity.qty,
                         opportunity.asks,
                     )
 
-                    if signal_keys.get(code) != identity:
+                    if signal_keys.get(code) != identity or live:
                         signal_keys[code] = identity
 
                         log(
@@ -1517,7 +1574,39 @@ async def main():
         action="store_true",
     )
 
+
+    parser.add_argument(
+        "--max-city-attempts",
+        type=int,
+        default=3,
+        help="Maximum attempts per city/day",
+    )
+
+    parser.add_argument(
+        "--city-cooldown-minutes",
+        type=D,
+        default=D("10"),
+        help="Minutes between entries in same city",
+    )
+
+    parser.add_argument(
+        "--max-city-event-pairs",
+        type=int,
+        default=30,
+        help="Cumulative filled pairs per city/event",
+    )
     args = parser.parse_args()
+
+    if (
+        args.max_city_attempts < 1
+        or args.max_city_event_pairs < 1
+        or not args.city_cooldown_minutes.is_finite()
+        or args.city_cooldown_minutes < 0
+    ):
+        parser.error(
+            "Invalid city attempt, cooldown, "
+            "or cumulative pair limit"
+        )
 
     args.cities = tuple(
         city.strip().upper()
