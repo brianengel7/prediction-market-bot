@@ -4,7 +4,7 @@ Default: continuous scanning and trading with configurable limits.
 --one-trade / --one-contract: exactly one contract per leg;
 one attempt total, then stop.
 
-LIVE_TRADING_ENABLED=true is required for real orders.
+KALSHI_LIVE_TRADING_ENABLED=true is required for real orders.
 """
 
 from __future__ import annotations
@@ -476,17 +476,6 @@ class Journal:
 
             self.data = data
 
-        unresolved = [
-            attempt
-            for attempt in self.data["attempts"]
-            if attempt.get("status") not in SAFE_STATUSES
-        ]
-
-        if unresolved:
-            raise RuntimeError(
-                "UNRESOLVED live attempt detected in "
-                f"{STATE_FILE}. Reconcile positions first."
-            )
 
     def write(self):
         temporary = STATE_FILE.with_suffix(".tmp")
@@ -502,6 +491,14 @@ class Journal:
             os.fsync(handle.fileno())
 
         os.replace(temporary, STATE_FILE)
+        directory_fd = os.open(
+            str(STATE_FILE.parent),
+            os.O_DIRECTORY,
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
     def reserve(self, op, *, one_trade, args):
@@ -622,14 +619,104 @@ class Journal:
         )
 
 
-async def unwind(
-    api,
-    books,
-    ticker,
-    qty,
-    journal,
-    record,
+from src.backtest.weather_order_reconciliation import (
+    ReconciliationError,
+    reconcile_order,
+    positions_for_event,
+    check_positions,
+    retry_allowed,
+)
+
+
+async def submit_verified(
+    api, journal, record, prefix,
+    ticker, side, price, qty, *,
+    reduce_only=False,
 ):
+    """Persist identity, POST once, verify against orders/fills."""
+    client_id = str(uuid.uuid4())
+
+    journal.update(
+        record,
+        prefix.upper() + "_POST_PREPARED",
+        **{prefix + "_client_id": client_id},
+    )
+
+    order_id = None
+
+    try:
+        _, order_id = await api.fok(
+            ticker,
+            side,
+            price,
+            qty,
+            client_id,
+            reduce_only=reduce_only,
+        )
+
+    except OrderRejected as exc:
+        journal.update(
+            record,
+            prefix.upper() + "_REJECTED",
+            **{
+                prefix + "_rejected": True,
+                prefix + "_rejection": str(exc),
+            },
+        )
+        return None
+
+    except OrderUnknown as exc:
+        log(
+            f"{prefix}: submission uncertain; "
+            f"querying Kalshi: {exc}"
+        )
+
+    # No second POST until the first outcome is proven.
+    verified = await reconcile_order(
+        api,
+        ticker=ticker,
+        client_id=client_id,
+        requested=qty,
+        order_id=order_id,
+        side=side,
+    )
+
+    journal.update(
+        record,
+        prefix.upper() + "_VERIFIED",
+        **{
+            prefix + "_order_id": verified.order_id,
+            prefix + "_filled": verified.filled,
+        },
+    )
+
+    log(
+        f"VERIFIED {prefix} {ticker}: "
+        f"{verified.filled}/{qty}, "
+        f"status={verified.status}"
+    )
+
+    return verified
+
+
+async def unwind_verified(
+    api, books, last_seen,
+    ticker, qty, journal, record,
+):
+    """One reduce-only FOK unwind; verify exchange fill."""
+    if (
+        time.monotonic()
+        - last_seen.get(ticker, 0) > 3
+    ):
+        journal.update(
+            record, "EXPOSED_STALE_UNWIND_BOOK"
+        )
+        log(
+            "CRITICAL: stale unwind book; "
+            "manual intervention required"
+        )
+        return False
+
     bids = [
         (usd(price), usd(depth))
         for price, depth
@@ -639,84 +726,248 @@ async def unwind(
 
     if not bids:
         journal.update(
-            record,
-            "EXPOSED_NO_UNWIND_BID",
+            record, "EXPOSED_NO_UNWIND_BID"
         )
-
         log(
-            f"CRITICAL: no full-depth YES bid "
-            f"to sell {qty} {ticker}. Position exposed."
+            "CRITICAL: insufficient YES bid "
+            "depth to unwind"
         )
-
         return False
 
     bid = max(bids)[0]
-    client_id = str(uuid.uuid4())
 
-    journal.update(
+    result = await submit_verified(
+        api,
+        journal,
         record,
-        "UNWIND_POST_PREPARED",
-        unwind_client_id=client_id,
+        "unwind",
+        ticker,
+        "ask",
+        bid,
+        qty,
+        reduce_only=True,
     )
 
-    try:
-        filled, order_id = await api.fok(
-            ticker,
-            "ask",
-            bid,
-            qty,
-            client_id,
-            reduce_only=True,
-        )
-
-    except Exception as exc:
+    if result is None or not result.full:
         journal.update(
-            record,
-            "EXPOSED_UNWIND_UNKNOWN",
-            error=repr(exc),
+            record, "EXPOSED_UNWIND_UNFILLED"
         )
-
         log(
-            f"CRITICAL: unwind uncertain or rejected: "
-            f"{exc}"
+            "CRITICAL: unwind not filled; "
+            "position remains exposed"
         )
-
         return False
 
-    journal.update(
-        record,
-        "UNWOUND"
-        if filled
-        else "EXPOSED_UNWIND_UNFILLED",
-        unwind_order_id=order_id,
+    event = record["key"].split(":", 1)[1]
+
+    await check_positions(
+        api,
+        event,
+        record["pre_positions"],
+        {},
     )
+
+    journal.update(record, "UNWOUND")
+    log(
+        f"UNWOUND verified: sold "
+        f"{qty} YES on {ticker}"
+    )
+    return True
+
+
+async def recover_startup(api, journal):
+    """Reconstruct unfinished trades before starting scanners."""
+    unresolved = [
+        record
+        for record in journal.data["attempts"]
+        if record.get("status") not in SAFE_STATUSES
+    ]
+
+    if not unresolved:
+        return
 
     log(
-        "UNWIND COMPLETED"
-        if filled
-        else "CRITICAL: unwind unfilled; position exposed"
+        "STARTUP RECONCILIATION: "
+        f"{len(unresolved)} unfinished attempt(s)"
     )
 
-    return filled
+    for record in unresolved:
+        first, second = record["legs"]
+        qty = int(record["qty"])
+
+        prefixes = (
+            "first",
+            "second",
+            "second_retry",
+            "unwind",
+        )
+
+        if (
+            record.get("status") == "RESERVED"
+            and not any(
+                record.get(prefix + "_client_id")
+                for prefix in prefixes
+            )
+        ):
+            journal.update(
+                record, "NOT_SUBMITTED"
+            )
+            continue
+
+        results = {}
+
+        for prefix, ticker, side in (
+            ("first", first, "bid"),
+            ("second", second, "bid"),
+            ("second_retry", second, "bid"),
+            ("unwind", first, "ask"),
+        ):
+            cid = record.get(
+                prefix + "_client_id"
+            )
+
+            if not cid:
+                continue
+
+            if record.get(
+                prefix + "_rejected"
+            ):
+                continue
+
+            results[prefix] = (
+                await reconcile_order(
+                    api,
+                    ticker=ticker,
+                    client_id=cid,
+                    requested=qty,
+                    order_id=record.get(
+                        prefix + "_order_id"
+                    ),
+                    side=side,
+                )
+            )
+
+            journal.update(
+                record,
+                "RECONCILING",
+                **{
+                    prefix + "_order_id":
+                        results[prefix].order_id,
+                    prefix + "_filled":
+                        results[prefix].filled,
+                },
+            )
+
+        a = results.get("first")
+        b = results.get("second")
+        retry = results.get("second_retry")
+        sale = results.get("unwind")
+
+        async def verify_restart_positions(changes):
+            # Settled historical contracts may no longer
+            # appear as positions. Fills remain authoritative.
+            same_day = (
+                record.get("timestamp", "")[:10]
+                == datetime.now(ET).date().isoformat()
+            )
+
+            if (
+                record.get("pre_positions")
+                and same_day
+            ):
+                await check_positions(
+                    api,
+                    record["key"].split(":", 1)[1],
+                    record["pre_positions"],
+                    changes,
+                )
+
+        if (
+            a is None
+            and record.get("first_rejected")
+            and not any((b, retry, sale))
+        ):
+            journal.update(
+                record, "NOT_SUBMITTED"
+            )
+
+        elif (
+            a
+            and a.unfilled
+            and not any((b, retry, sale))
+        ):
+            await verify_restart_positions({})
+            journal.update(
+                record, "FIRST_UNFILLED"
+            )
+
+        elif (
+            a
+            and a.full
+            and sum(
+                obj.filled
+                for obj in (b, retry)
+                if obj is not None
+            ) == qty
+            and (sale is None or sale.unfilled)
+        ):
+            await verify_restart_positions({
+                first: qty,
+                second: qty,
+            })
+            journal.update(
+                record, "COMPLETE"
+            )
+
+        elif (
+            a
+            and a.full
+            and sale
+            and sale.full
+            and not any(
+                obj and obj.filled
+                for obj in (b, retry)
+            )
+        ):
+            await verify_restart_positions({})
+            journal.update(
+                record, "UNWOUND"
+            )
+
+        else:
+            raise ReconciliationError(
+                "Unresolved exposure for "
+                f"{record['id']} "
+                f"({record['key']}). "
+                "Fresh-book/manual recovery required; "
+                "new entries prohibited."
+            )
+
+    log(
+        "STARTUP RECONCILIATION: "
+        "safe historical states resolved"
+    )
 
 
 async def execute(
-    api,
-    journal,
-    books,
-    last_seen,
-    op,
-    tickers,
-    args,
+    api, journal, books, last_seen,
+    op, tickers, args,
 ):
-    # Recheck immediately before reserving the attempt.
+    """Two verified YES legs, one retry, one bounded unwind."""
     latest = evaluate(
         op.city,
         op.event,
         books,
         tickers,
         one_trade=args.one_trade,
-        max_pairs=min(args.max_pairs, journal.remaining_city_event_pairs(op.city, op.event, args.max_city_event_pairs)),
+        max_pairs=min(
+            args.max_pairs,
+            journal.remaining_city_event_pairs(
+                op.city,
+                op.event,
+                args.max_city_event_pairs,
+            ),
+        ),
         max_cost=args.max_cost,
     )
 
@@ -727,8 +978,7 @@ async def execute(
         or any(
             new > old
             for new, old in zip(
-                latest.asks,
-                op.asks,
+                latest.asks, op.asks
             )
         )
         or any(
@@ -739,85 +989,89 @@ async def execute(
     ):
         log(
             f"{op.city}: preflight failed; "
-            "candidate changed or stale"
+            "no orders submitted"
         )
         return False, False
 
-    # Cached balance avoids an extra REST round-trip
-    # during the critical entry path.
     cash = getattr(
-        api,
-        "cached_balance",
-        None,
+        api, "cached_balance", None
     )
-
     if cash is None:
         cash = await api.balance()
 
     if cash < op.allin:
         log(
-            f"{op.city}: insufficient available cash "
-            f"${cash:.2f} vs ${op.allin:.2f}"
+            f"{op.city}: insufficient cash; "
+            "no orders submitted"
         )
         return False, False
 
-    record = journal.reserve(
-        op,
-        one_trade=args.one_trade, args=args,
+    # Capture account exposure before the first order.
+    baseline = await positions_for_event(
+        api,
+        op.event,
+        op.legs,
     )
 
-    log(
-        f"LIVE ATTEMPT {op.city} "
-        f"qty={op.qty} per leg "
-        f"estimated_total=${op.allin:.2f}"
+    record = journal.reserve(
+        op,
+        one_trade=args.one_trade,
+        args=args,
+    )
+
+    journal.update(
+        record,
+        "RESERVED",
+        pre_positions={
+            ticker: str(value)
+            for ticker, value in baseline.items()
+        },
     )
 
     first, second = op.legs
 
+    log(
+        f"LIVE ATTEMPT {op.city}: "
+        f"qty={op.qty}, "
+        f"estimated=${op.allin:.2f}"
+    )
+
     try:
-        client_id_1 = str(uuid.uuid4())
-
-        journal.update(
+        a = await submit_verified(
+            api,
+            journal,
             record,
-            "FIRST_POST_PREPARED",
-            first_client_id=client_id_1,
-        )
-
-        filled1, order1 = await api.fok(
+            "first",
             first,
             "bid",
             op.asks[0],
             op.qty,
-            client_id_1,
         )
 
-        journal.update(
-            record,
-            "FIRST_ACK",
-            first_order_id=order1,
-            first_filled=filled1,
-        )
-
-        if not filled1:
+        if a is None:
             journal.update(
-                record,
-                "FIRST_UNFILLED",
+                record, "NOT_SUBMITTED"
             )
-
-            log(
-                "FIRST LEG UNFILLED. "
-                "No second order; attempt consumed."
-            )
-
             return True, False
 
-        # Recheck second-leg ask and depth.
-        second_quote = quotes(books[second])
+        if a.unfilled:
+            journal.update(
+                record, "FIRST_UNFILLED"
+            )
+            return True, False
+
+        if not a.full:
+            raise ReconciliationError(
+                "First leg not conclusively filled"
+            )
+
+        second_quote = quotes(
+            books[second]
+        )
 
         second_fresh = (
             time.monotonic()
-            - last_seen.get(second, 0)
-            <= 3
+            - last_seen.get(second, 0) <= 3
         )
 
         if (
@@ -827,94 +1081,163 @@ async def execute(
             or second_quote[1] > op.asks[1]
         ):
             log(
-                "SECOND LEG PRICE/DEPTH CHANGED. "
-                "Attempting first-leg unwind."
+                "Second-leg price/depth changed. "
+                "Attempting verified unwind."
             )
 
-            success = await unwind(
+            safe = await unwind_verified(
                 api,
                 books,
+                last_seen,
                 first,
                 op.qty,
                 journal,
                 record,
             )
+            return True, not safe
 
-            return True, not success
-
-        client_id_2 = str(uuid.uuid4())
-
-        journal.update(
+        b = await submit_verified(
+            api,
+            journal,
             record,
-            "SECOND_POST_PREPARED",
-            second_client_id=client_id_2,
+            "second",
+            second,
+            "bid",
+            op.asks[1],
+            op.qty,
         )
 
-        try:
-            filled2, order2 = await api.fok(
-                second,
-                "bid",
-                op.asks[1],
-                op.qty,
-                client_id_2,
+        if b and b.full:
+            await check_positions(
+                api,
+                op.event,
+                baseline,
+                {
+                    first: op.qty,
+                    second: op.qty,
+                },
             )
 
-        except OrderRejected as exc:
+            journal.update(
+                record, "COMPLETE"
+            )
             log(
-                f"SECOND LEG REJECTED: {exc}. "
-                "Attempting unwind."
+                "BASKET COMPLETE VERIFIED: "
+                f"{op.city} {op.qty} pairs"
             )
+            return True, False
 
-            success = await unwind(
-                api,
-                books,
-                first,
-                op.qty,
-                journal,
-                record,
+        if b is not None and not b.unfilled:
+            raise ReconciliationError(
+                "Second order execution ambiguous"
             )
-
-            return True, not success
-
-        # Unknown submission state must not be
-        # blindly unwound: it may have filled.
-        journal.update(
-            record,
-            "SECOND_ACK",
-            second_order_id=order2,
-            second_filled=filled2,
-        )
-
-        if not filled2:
-            log(
-                "SECOND LEG FOK UNFILLED. "
-                "Attempting first-leg unwind."
-            )
-
-            success = await unwind(
-                api,
-                books,
-                first,
-                op.qty,
-                journal,
-                record,
-            )
-
-            return True, not success
-
-        journal.update(
-            record,
-            "COMPLETE",
-            complete=True,
-        )
 
         log(
-            f"BASKET COMPLETE: {op.city} "
-            f"{op.qty} pair(s). "
-            "Settlement profit is not guaranteed."
+            "SECOND LEG conclusively unfilled or "
+            "rejected. Evaluating bounded retry."
         )
 
-        return True, False
+        quote = quotes(
+            books[second]
+        )
+
+        retry_price = (
+            quote[1] if quote else None
+        )
+        depth = (
+            int(quote[3]) if quote else 0
+        )
+
+        fresh = (
+            time.monotonic()
+            - last_seen.get(second, 0) <= 3
+        )
+
+        started = datetime.fromisoformat(
+            record["timestamp"]
+        ).timestamp()
+
+        elapsed = max(
+            0,
+            time.time() - started,
+        )
+
+        allowed = (
+            fresh
+            and retry_allowed(
+                first_price=op.asks[0],
+                second_price=retry_price,
+                original_second_limit=op.asks[1],
+                qty_requested=op.qty,
+                depth=depth,
+                elapsed=elapsed,
+                max_cost=args.max_cost,
+                fee=fee,
+            )
+        )
+
+        if allowed:
+            log(
+                "SECOND-LEG RETRY: "
+                f"one FOK limit={retry_price:.4f}"
+            )
+
+            retry = await submit_verified(
+                api,
+                journal,
+                record,
+                "second_retry",
+                second,
+                "bid",
+                retry_price,
+                op.qty,
+            )
+
+            if retry and retry.full:
+                await check_positions(
+                    api,
+                    op.event,
+                    baseline,
+                    {
+                        first: op.qty,
+                        second: op.qty,
+                    },
+                )
+
+                journal.update(
+                    record, "COMPLETE"
+                )
+                log(
+                    "BASKET COMPLETE VERIFIED "
+                    f"AFTER RETRY: {op.city}"
+                )
+                return True, False
+
+            if (
+                retry is not None
+                and not retry.unfilled
+            ):
+                raise ReconciliationError(
+                    "Retry outcome not conclusively unfilled"
+                )
+
+        else:
+            log(
+                "RETRY SKIPPED: stale quote, "
+                "price, depth, or 5-second limit"
+            )
+
+        safe = await unwind_verified(
+            api,
+            books,
+            last_seen,
+            first,
+            op.qty,
+            journal,
+            record,
+        )
+
+        return True, not safe
 
     except Exception as exc:
         journal.update(
@@ -924,11 +1247,13 @@ async def execute(
         )
 
         log(
-            f"CRITICAL: order state unknown or "
-            f"execution failed: {exc}"
+            f"CRITICAL: {exc}; "
+            "new orders blocked until reconciled"
         )
 
         return True, True
+
+
 
 
 async def fetch_event(http, code):
@@ -1038,7 +1363,7 @@ async def ws_session(
         seconds, next_code = waiting[0]
 
         log(
-            f"WAITING: no city past 1 PM local. "
+            f"WAITING: no city past 2 PM local. "
             f"Next={next_code} in "
             f"{seconds / 60:.1f} minutes"
         )
@@ -1724,6 +2049,8 @@ async def main():
         api = Kalshi()
 
         try:
+            if live:
+                await recover_startup(api, journal)
             cash = await api.balance()
 
             log(
