@@ -316,38 +316,72 @@ async def reconcile_once(
 
 
 async def reconcile_order(
-    api, *,
-    ticker,
-    client_id,
-    requested,
-    order_id=None,
-    side="bid",
-    book_side=None,
-    tries=3,
+    api, *, ticker, client_id, requested,
+    order_id=None, side="bid", book_side=None, tries=4,
 ):
-    """Read-only verification with bounded propagation retries."""
+    """Read-only verification with order-list fallback."""
     if book_side is not None:
         side = book_side
 
-    error = None
-    for index in range(tries):
-        try:
-            return await reconcile_once(
-                api,
-                ticker=ticker,
-                client_id=client_id,
-                requested=requested,
-                order_id=order_id,
-                side=side,
+    if (
+        side not in ("bid", "ask")
+        or not client_id
+        or not ticker
+        or requested < 1
+    ):
+        raise ReconciliationError(
+            "Invalid reconciliation identity"
+        )
+
+    if not isinstance(tries, int) or not 1 <= tries <= 8:
+        raise ValueError("Invalid retry count")
+
+    last = None
+
+    for attempt in range(tries):
+        # Try exact order ID, then client-ID lookup.
+        # A 404 is NOT proof that the order failed.
+        candidates = (
+            (order_id, None) if order_id else (None,)
+        )
+
+        for lookup_id in candidates:
+            try:
+                result = await reconcile_once(
+                    api,
+                    ticker=ticker,
+                    client_id=client_id,
+                    requested=requested,
+                    order_id=lookup_id,
+                    side=side,
+                )
+
+                if (
+                    result.ticker != ticker
+                    or result.client_id != client_id
+                    or (
+                        order_id
+                        and result.order_id != order_id
+                    )
+                ):
+                    raise ReconciliationError(
+                        "Reconciliation identity mismatch"
+                    )
+
+                return result
+
+            except Exception as exc:
+                last = exc
+
+        if attempt + 1 < tries:
+            await asyncio.sleep(
+                (0.15, 0.35, 0.70, 1.0, 1.0, 1.0, 1.0)[attempt]
             )
-        except Exception as exc:
-            error = exc
-            if index + 1 < tries:
-                await asyncio.sleep(0.3 * (index + 1))
 
     raise ReconciliationError(
-        f"Unable to prove outcome of {client_id}: {error}"
-    ) from error
+        f"Unable to prove outcome of {client_id} "
+        f"after {tries} attempts: {last}"
+    ) from last
 
 
 async def positions_for_event(api, event, legs):

@@ -17,54 +17,63 @@ class RecoveryEdgeCases(unittest.TestCase):
         self.addCleanup(fx.doCleanups)
         return fx
 
-    def test_first_rejection_stops_basket(self):
+    def test_first_rejected_second_filled_gtc_unwind(self):
         fx = self.fixture()
-        result, api = fx.run_flow(["reject"])
-
-        self.assertEqual(result, (True, False))
-        self.assertEqual(len(api.calls), 1)
-        self.assertEqual(
-            fx.journal.data["attempts"][-1]["status"],
-            "NOT_SUBMITTED",
+        result, api = fx.run_flow(
+            ["reject", "fill"], ["fill"]
         )
-
-    def test_second_rejection_one_retry(self):
-        fx = self.fixture()
-        result, api = fx.run_flow([
-            "fill", "reject", "fill",
-        ])
-
         self.assertEqual(result, (True, False))
         self.assertEqual(len(api.calls), 3)
-        self.assertEqual(
-            fx.journal.data["attempts"][-1]["status"],
-            "COMPLETE",
-        )
 
-    def test_failed_unwind_halts(self):
+        rec = fx.journal.data["attempts"][-1]
+        self.assertEqual(rec["status"], "UNWOUND")
+        self.assertEqual(rec["unwind_ticker"], "B")
+        self.assertTrue(rec["first_rejected"])
+        self.assertEqual(api.positions["B"], 0)
+
+    def test_second_rejected_gtc_rests(self):
         fx = self.fixture()
-        result, api = fx.run_flow([
-            "fill", "unfilled", "unfilled", "reject",
-        ])
-
-        self.assertEqual(result, (True, True))
-        self.assertEqual(len(api.calls), 4)
-        self.assertEqual(
-            fx.journal.data["attempts"][-1]["status"],
-            "EXPOSED_UNWIND_UNFILLED",
+        result, api = fx.run_flow(
+            ["fill", "reject"], ["resting"]
         )
-
-    def test_uncertain_unwind_no_repeat(self):
-        fx = self.fixture()
-        result, api = fx.run_flow([
-            "fill", "unfilled", "unfilled", "absent",
-        ])
-
         self.assertEqual(result, (True, True))
-        self.assertEqual(len(api.calls), 4)
+        self.assertEqual(len(api.calls), 3)
+
+        rec = fx.journal.data["attempts"][-1]
+        self.assertEqual(rec["status"], "UNWIND_RESTING")
+        self.assertEqual(rec["unwind_ticker"], "A")
+        self.assertTrue(rec["second_rejected"])
+
+    def test_failed_gtc_unwind_halts(self):
+        fx = self.fixture()
+        result, api = fx.run_flow(
+            ["fill", "unfilled"], ["reject"]
+        )
+        self.assertEqual(result, (True, True))
+        self.assertEqual(len(api.calls), 3)
+
+        rec = fx.journal.data["attempts"][-1]
         self.assertEqual(
-            fx.journal.data["attempts"][-1]["status"],
-            "UNRESOLVED_NEEDS_RECONCILIATION",
+            rec["status"], "EXPOSED_UNWIND_REJECTED"
+        )
+        self.assertEqual(api.positions["A"], 2)
+
+    def test_uncertain_gtc_unwind_no_repeat(self):
+        fx = self.fixture()
+        result, api = fx.run_flow(
+            ["fill", "unfilled"], ["unknown"]
+        )
+        self.assertEqual(result, (True, True))
+        self.assertEqual(len(api.calls), 3)
+
+        rec = fx.journal.data["attempts"][-1]
+        self.assertEqual(
+            rec["status"], "EXPOSED_UNWIND_UNKNOWN"
+        )
+        self.assertTrue(rec["unwind_client_id"])
+        self.assertEqual(
+            len([c for c in api.calls if c[1] == "ask"]),
+            1,
         )
 
     def test_uncertain_first_verified(self):
