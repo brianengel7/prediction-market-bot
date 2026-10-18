@@ -447,6 +447,74 @@ class Kalshi:
             f"remaining={remaining}"
         )
 
+    async def gtc_sell(self, ticker, price, qty, client_id):
+        """Submit one persistent YES limit sell, without retries."""
+        price = D(str(price))
+        if not D(0) < price < ONE or not isinstance(qty, int) or qty < 1:
+            raise ValueError("Invalid GTC sell price or quantity")
+
+        path = "/portfolio/events/orders"
+        body = {
+            "ticker": ticker,
+            "side": "ask",
+            "count": f"{qty}.00",
+            "price": f"{price:.4f}",
+            "time_in_force": "good_till_canceled",
+            "client_order_id": client_id,
+            "self_trade_prevention_type": "maker",
+            "cancel_order_on_pause": False,
+        }
+
+        log(
+            f"POST GTC ASK {qty} {ticker} "
+            f"limit={price:.4f} client_id={client_id}"
+        )
+
+        try:
+            response = await self.client.post(
+                self.base + path,
+                json=body,
+                headers=self.headers("POST", path),
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise OrderUnknown(
+                f"GTC unwind submission uncertain: {exc}"
+            ) from exc
+
+        if response.status_code in (408, 409, 429) or response.status_code >= 500:
+            raise OrderUnknown(
+                f"GTC unwind HTTP {response.status_code}: "
+                "submission uncertain"
+            )
+
+        if response.status_code != 201:
+            raise OrderRejected(
+                f"GTC unwind HTTP {response.status_code}: "
+                f"{response.text[:350]}"
+            )
+
+        try:
+            data = response.json()
+            order = data.get("order", data)
+            order_id = order["order_id"]
+            filled = usd(order["fill_count"])
+            remaining = usd(order["remaining_count"])
+            if not order_id or filled < 0 or remaining < 0:
+                raise ValueError("Invalid GTC acknowledgement")
+            if filled + remaining > D(qty):
+                raise ValueError("GTC acknowledgement exceeds quantity")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OrderUnknown(
+                "GTC accepted but acknowledgement incomplete; "
+                "reconcile by client_order_id"
+            ) from exc
+
+        log(
+            f"GTC ACK {ticker} id={order_id} "
+            f"filled={filled} remaining={remaining}"
+        )
+        return order_id, filled, remaining
+
     async def close(self):
         await self.client.aclose()
 
@@ -703,62 +771,108 @@ async def unwind_verified(
     api, books, last_seen,
     ticker, qty, journal, record,
 ):
-    """One reduce-only FOK unwind; verify exchange fill."""
-    if (
-        time.monotonic()
-        - last_seen.get(ticker, 0) > 3
-    ):
-        journal.update(
-            record, "EXPOSED_STALE_UNWIND_BOOK"
-        )
-        log(
-            "CRITICAL: stale unwind book; "
-            "manual intervention required"
-        )
-        return False
+    """Rest a GTC sell at the original first-leg buy limit."""
+    if record["legs"][0] != ticker:
+        raise ReconciliationError("Unwind ticker mismatch")
 
-    bids = [
-        (usd(price), usd(depth))
-        for price, depth
-        in books[ticker].levels["yes"].items()
-        if usd(depth) >= D(qty)
-    ]
+    if D(str(record.get("first_filled", 0))) != D(qty):
+        raise ReconciliationError("First-leg fill not verified")
 
-    if not bids:
-        journal.update(
-            record, "EXPOSED_NO_UNWIND_BID"
-        )
-        log(
-            "CRITICAL: insufficient YES bid "
-            "depth to unwind"
-        )
-        return False
+    for key in ("second_filled", "second_retry_filled"):
+        if D(str(record.get(key) or 0)) != 0:
+            raise ReconciliationError(
+                "Cannot sell full first leg when second leg partially filled"
+            )
 
-    bid = max(bids)[0]
-
-    result = await submit_verified(
-        api,
-        journal,
-        record,
-        "unwind",
-        ticker,
-        "ask",
-        bid,
-        qty,
-        reduce_only=True,
-    )
-
-    if result is None or not result.full:
-        journal.update(
-            record, "EXPOSED_UNWIND_UNFILLED"
+    if record.get("unwind_client_id"):
+        raise ReconciliationError(
+            "Unwind already submitted or uncertain; never duplicate"
         )
-        log(
-            "CRITICAL: unwind not filled; "
-            "position remains exposed"
-        )
-        return False
+
+    # This is the limit used for the original first-leg buy.
+    buy_price = usd(record["asks"][0])
+    if not D(0) < buy_price < ONE:
+        raise ReconciliationError("Invalid recorded purchase limit")
 
     event = record["key"].split(":", 1)[1]
+
+    # Since GTC cannot use reduce_only, verify that the
+    # purchased position is present before submitting.
+    await check_positions(
+        api,
+        event,
+        record["pre_positions"],
+        {ticker: qty},
+    )
+
+    client_id = str(uuid.uuid4())
+
+    # Save identity BEFORE submitting the order.
+    journal.update(
+        record,
+        "UNWIND_POST_PREPARED",
+        unwind_client_id=client_id,
+        unwind_limit_price=str(buy_price),
+        unwind_time_in_force="good_till_canceled",
+    )
+
+    try:
+        order_id, filled, remaining = await api.gtc_sell(
+            ticker, buy_price, qty, client_id,
+        )
+    except OrderRejected as exc:
+        journal.update(
+            record,
+            "EXPOSED_UNWIND_REJECTED",
+            error=str(exc),
+        )
+        log(f"CRITICAL: GTC unwind rejected: {exc}")
+        return False
+    except Exception as exc:
+        journal.update(
+            record,
+            "EXPOSED_UNWIND_UNKNOWN",
+            error=repr(exc),
+        )
+        log(
+            "CRITICAL: GTC unwind submission uncertain. "
+            "Do not resubmit blindly."
+        )
+        return False
+
+    journal.update(
+        record,
+        "UNWIND_RESTING",
+        unwind_order_id=order_id,
+        unwind_filled=str(filled),
+        unwind_remaining=str(remaining),
+    )
+
+    if filled != D(qty) or remaining != 0:
+        log(
+            f"GTC UNWIND PENDING {ticker}: "
+            f"filled={filled}/{qty} remaining={remaining}; "
+            f"order_id={order_id}. "
+            "No automatic cancellation. "
+            "New trading blocked until resolved."
+        )
+        return False
+
+    # Only mark UNWOUND after independently verifying
+    # every contract was sold.
+    verified = await reconcile_order(
+        api,
+        ticker=ticker,
+        client_id=client_id,
+        requested=qty,
+        order_id=order_id,
+        side="ask",
+    )
+
+    if not verified.full:
+        raise ReconciliationError(
+            "GTC appears filled but execution verification incomplete"
+        )
 
     await check_positions(
         api,
@@ -767,10 +881,15 @@ async def unwind_verified(
         {},
     )
 
-    journal.update(record, "UNWOUND")
+    journal.update(
+        record,
+        "UNWOUND",
+        unwind_filled=str(qty),
+        unwind_remaining="0",
+    )
     log(
-        f"UNWOUND verified: sold "
-        f"{qty} YES on {ticker}"
+        f"UNWOUND VERIFIED: sold {qty} YES "
+        f"on {ticker} at buy limit {buy_price}"
     )
     return True
 
