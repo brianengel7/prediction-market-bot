@@ -42,6 +42,34 @@ def count(row, *names):
     )
 
 
+def fill_count(row):
+    """Allow fractional individual fills, with exact decimal accounting."""
+    raw = row.get("count_fp")
+    if raw is None:
+        raw = row.get("count")
+
+    if raw is None:
+        raise ReconciliationError("Fill missing contract quantity")
+
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ReconciliationError(
+            "Invalid fill contract quantity"
+        ) from exc
+
+    if (
+        not value.is_finite()
+        or value <= 0
+        or value * 100 != (value * 100).to_integral_value()
+    ):
+        raise ReconciliationError(
+            f"Invalid fixed-point fill quantity {raw!r}"
+        )
+
+    return value
+
+
 async def paged(api, path, kind, params, pages=10):
     result = []
     cursor = None
@@ -253,7 +281,7 @@ async def reconcile_once(
     )
 
     seen = set()
-    total = 0
+    total = Decimal(0)
 
     for fill in fills:
         if (
@@ -301,7 +329,7 @@ async def reconcile_once(
             )
         seen.add(fid)
 
-        total += count(fill, "count_fp", "count")
+        total += fill_count(fill)
 
     if total != filled:
         raise ReconciliationError(
