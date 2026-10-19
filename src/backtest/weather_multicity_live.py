@@ -51,7 +51,7 @@ STATE_FILE = Path(".weather_multicity_live_state.json")
 LOCK_FILE = Path(".weather_multicity_live_process.lock")
 
 TOP_TWO_MIN = D("0.75")
-BASKET_CAP = D("0.97")
+BASKET_CAP = D("0.96")
 ONE = D("1")
 
 SAFE_STATUSES = {
