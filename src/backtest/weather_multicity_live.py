@@ -627,6 +627,7 @@ class Journal:
             for a in self.data["attempts"]
             if a.get("key") == key
             and a.get("status") == "COMPLETE"
+            and a.get("closed_exposure_verified") is not True
         )
 
         return max(0, limit - held)
@@ -640,6 +641,7 @@ class Journal:
             if (
                 record.get("key") != key
                 or record.get("status") != "COMPLETE"
+                or record.get("closed_exposure_verified") is True
             ):
                 continue
 
