@@ -317,7 +317,7 @@ async def reconcile_once(
 
 async def reconcile_order(
     api, *, ticker, client_id, requested,
-    order_id=None, side="bid", book_side=None, tries=4,
+    order_id=None, side="bid", book_side=None, tries=12,
 ):
     """Read-only verification with order-list fallback."""
     if book_side is not None:
@@ -333,7 +333,7 @@ async def reconcile_order(
             "Invalid reconciliation identity"
         )
 
-    if not isinstance(tries, int) or not 1 <= tries <= 8:
+    if not isinstance(tries, int) or not 1 <= tries <= 12:
         raise ValueError("Invalid retry count")
 
     last = None
@@ -375,7 +375,7 @@ async def reconcile_order(
 
         if attempt + 1 < tries:
             await asyncio.sleep(
-                (0.15, 0.35, 0.70, 1.0, 1.0, 1.0, 1.0)[attempt]
+                (0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 1.5, 2.0, 2.0, 2.0)[attempt]
             )
 
     raise ReconciliationError(
