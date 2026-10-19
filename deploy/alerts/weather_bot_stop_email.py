@@ -106,6 +106,8 @@ def main():
         headers={
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; WeatherBotAlerts/1.0)",
+            "Accept": "application/json",
             "Idempotency-Key": (
                 "weather-bot-stop-" + str(uuid.uuid4())
             ),
