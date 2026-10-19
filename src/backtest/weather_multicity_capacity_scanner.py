@@ -36,9 +36,23 @@ CITY = {
     "PHL": ("Philadelphia", "KXHIGHPHIL", "America/New_York"),
     "PHX": ("Phoenix", "KXHIGHTPHX", "America/Phoenix"),
     "SEA": ("Seattle", "KXHIGHTSEA", "America/Los_Angeles"),
+    'ATL': ('Atlanta', 'KXHIGHTATL', 'America/New_York'),
+    'DAL': ('Dallas', 'KXHIGHTDAL', 'America/Chicago'),
+    'HOU': ('Houston', 'KXHIGHTHOU', 'America/Chicago'),
+    'LV': ('Las Vegas', 'KXHIGHTLV', 'America/Los_Angeles'),
+    'SDF': ('Louisville', 'KXHIGHTSDF', 'America/New_York'),
+    'MIN': ('Minneapolis', 'KXHIGHTMIN', 'America/Chicago'),
+    'NOLA': ('New Orleans', 'KXHIGHTNOLA', 'America/Chicago'),
+    'EWR': ('Newark', 'KXHIGHTEWR', 'America/New_York'),
+    'OKC': ('Oklahoma City', 'KXHIGHTOKC', 'America/Chicago'),
+    'SATX': ('San Antonio', 'KXHIGHTSATX', 'America/Chicago'),
+    'SAN': ('San Diego', 'KXHIGHTSAN', 'America/Los_Angeles'),
+    'SFO': ('San Francisco', 'KXHIGHTSFO', 'America/Los_Angeles'),
+    'TTN': ('Trenton', 'KXHIGHTTTN', 'America/New_York'),
+    'DC': ('Washington DC', 'KXHIGHTDC', 'America/New_York'),
 }
 
-DEFAULT_CITIES = "NYC,CHI,LAX,MIA,DEN,AUS,BOS,PHL,PHX,SEA"
+DEFAULT_CITIES = 'NYC,CHI,LAX,MIA,DEN,AUS,BOS,PHL,PHX,SEA,ATL,DAL,HOU,LV,SDF,MIN,NOLA,EWR,OKC,SATX,SAN,SFO,TTN,DC'
 DELAYS = (100, 250, 500, 1000, 2000, 5000)
 
 
@@ -959,7 +973,7 @@ def args_parser():
     parser.add_argument(
         "--cap-cents",
         type=str,
-        default="97",
+        default="96",
     )
     parser.add_argument(
         "--sizes",
