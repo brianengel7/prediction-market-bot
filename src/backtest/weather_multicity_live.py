@@ -631,7 +631,51 @@ class Journal:
 
         return max(0, limit - held)
 
+    def completed_event_pairs(self, city, event):
+        """Completed YES pairs, independent of ranking order."""
+        key = f"{city}:{event}"
+        pairs = set()
+
+        for record in self.data["attempts"]:
+            if (
+                record.get("key") != key
+                or record.get("status") != "COMPLETE"
+            ):
+                continue
+
+            legs = record.get("legs")
+            if (
+                not isinstance(legs, (list, tuple))
+                or len(legs) != 2
+                or not all(isinstance(x, str) and x for x in legs)
+                or legs[0] == legs[1]
+            ):
+                raise RuntimeError(
+                    f"Invalid completed basket history: {key}; "
+                    "trading blocked"
+                )
+
+            pairs.add(tuple(sorted(legs)))
+
+        return pairs
+
     def entry_block_reason(self, op, args):
+        completed = self.completed_event_pairs(op.city, op.event)
+
+        if len(completed) > 1:
+            return (
+                "multiple completed pairs in city/event; "
+                "manual review required"
+            )
+
+        pair = tuple(sorted(op.legs))
+
+        if completed and pair not in completed:
+            return (
+                f"pair locked to {next(iter(completed))}; "
+                f"blocked {pair}"
+            )
+
         if (
             args.one_trade
             and self.data.get("single_attempt_claimed")
@@ -1146,6 +1190,16 @@ async def execute(
         log(f"{op.city}: preflight failed; no orders sent")
         return False, False
 
+    # Check the persisted pair lock before execution.
+    block = journal.entry_block_reason(op, args)
+
+    if block is not None:
+        log(
+            f"{op.city}: entry blocked: {block}; "
+            "no orders submitted"
+        )
+        return False, False
+
     cash = getattr(api, "cached_balance", None)
 
     if cash is None:
@@ -1155,9 +1209,28 @@ async def execute(
         log(f"{op.city}: insufficient cash; no orders sent")
         return False, False
 
-    baseline = await positions_for_event(
-        api, op.event, op.legs,
+    # Reject third-outcome exposure already held on Kalshi.
+    all_positions = await positions_for_event(
+        api, op.event, tickers,
     )
+
+    others = {
+        ticker: qty
+        for ticker, qty in all_positions.items()
+        if ticker not in op.legs and qty != 0
+    }
+
+    if others:
+        log(
+            f"{op.city}: existing third-outcome exposure "
+            f"{others}; no orders submitted"
+        )
+        return False, False
+
+    baseline = {
+        ticker: all_positions[ticker]
+        for ticker in op.legs
+    }
 
     record = journal.reserve(
         op,
@@ -1802,7 +1875,32 @@ async def ws_session(
                     max_cost=args.max_cost,
                 )
 
-                if opportunity and (not live or journal.entry_block_reason(opportunity, args) is None):
+                block = (
+                    journal.entry_block_reason(opportunity, args)
+                    if opportunity is not None and live
+                    else None
+                )
+
+                if block is not None and (
+                    block.startswith("pair locked to")
+                    or block.startswith("multiple completed pairs")
+                ):
+                    marker = (
+                        "PAIR_LOCK_BLOCKED",
+                        opportunity.legs,
+                        block,
+                    )
+
+                    if signal_keys.get(code) != marker:
+                        log(
+                            f"PAIR LOCK BLOCKED {code}: "
+                            f"{block}"
+                        )
+
+                    signal_keys[code] = marker
+                    continue
+
+                if opportunity and (not live or block is None):
                     identity = (
                         opportunity.legs,
                         opportunity.qty,
