@@ -31,3 +31,12 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+# Private credentials
+/secrets/
+*.pem
+
+# Live trading state
+.weather_multicity_live_state.json
+.weather_multicity_live_state.json.*
+.weather_multicity_live_process.lock
+.weather_multicity_live_process.lock.*
