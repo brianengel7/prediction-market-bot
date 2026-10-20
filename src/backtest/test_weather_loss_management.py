@@ -203,11 +203,10 @@ class Tests(unittest.TestCase):
         self.tick(manager, 0)
         self.tick(manager, 1)
 
-        with self.assertRaises(RuntimeError):
-            self.tick(manager, 2)
+        self.tick(manager, 2)
 
         entry = self.journal.data["loss_exits"]["DEN:EVENT"]
-        self.assertEqual(entry["state"], "HALTED")
+        self.assertEqual(entry["state"], "RECONCILING")
         self.assertTrue(entry["loss_sell_0_client_id"])
 
     def test_restart_reconciles_without_resubmission(self):
@@ -226,6 +225,7 @@ class Tests(unittest.TestCase):
             return SimpleNamespace(
                 order_id="OID1",
                 filled=3,
+                terminal=True,
             )
 
         asyncio.run(
@@ -235,7 +235,7 @@ class Tests(unittest.TestCase):
         )
 
         self.assertEqual(entry["state"], "ACTIVE")
-        self.assertEqual(entry["loss_sell_0_filled"], 3)
+        self.assertEqual(D(str(entry["loss_sell_0_filled"])), D(3))
         self.assertEqual(self.calls, [])
 
     def test_position_mismatch_blocks_selling(self):
@@ -245,8 +245,7 @@ class Tests(unittest.TestCase):
         self.tick(manager, 0)
         self.tick(manager, 1)
 
-        with self.assertRaises(RuntimeError):
-            self.tick(manager, 2)
+        self.tick(manager, 2)
 
         self.assertEqual(self.calls, [])
         self.assertEqual(

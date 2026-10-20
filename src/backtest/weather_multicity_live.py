@@ -1794,6 +1794,7 @@ async def ws_session(
         positions=positions_for_event,
         submit=submit_verified,
         log=log,
+        reconcile=reconcile_order,
     )
 
     updates = 0
@@ -2508,11 +2509,7 @@ async def main():
                         )
                     ]
 
-                    unsafe_exits = [
-                        e for e in outstanding_exits(journal).values()
-                        if e.get('state') != 'ACTIVE'
-                    ]
-                    if unresolved or unsafe_exits:
+                    if unresolved:
                         raise RuntimeError(
                             "Unresolved exchange order. "
                             "Stop and reconcile manually."

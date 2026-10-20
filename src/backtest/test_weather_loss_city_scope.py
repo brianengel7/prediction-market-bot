@@ -111,7 +111,8 @@ class CityScopedExitTests(unittest.TestCase):
 
     def test_global_uncertainty_halt_retained(self):
         source = inspect.getsource(live.main)
-        self.assertIn("unsafe_exits = [", source)
+        self.assertNotIn("unsafe_exits = [", source)
+        self.assertIn("if unresolved:", source)
 
 
 if __name__ == "__main__":

@@ -39,37 +39,77 @@ def _pending_order_fields(entry):
             yield prefix, cid
 
 
-async def recover_loss_exits(api, journal, reconcile_order):
-    """Recover saved sell orders without submitting replacements."""
+async def recover_loss_exits(
+    api, journal, reconcile_order, *,
+    keys=None, on_log=None,
+):
+    """Reconcile existing sell identities without resubmitting."""
     for key, entry in outstanding_exits(journal).items():
+        if keys is not None and key not in keys:
+            continue
+
         pending = list(_pending_order_fields(entry))
-        if entry.get("state") == "HALTED" and not pending:
-            raise RuntimeError(f"Loss exit {key} requires manual review")
+        if not pending:
+            continue
+
+        error = str(entry.get("error", ""))
+        if entry.get("state") == "HALTED" and any(
+            item in error for item in (
+                "Position mismatch",
+                "Fractional holdings require manual review",
+                "Invalid holding precision",
+            )
+        ):
+            continue
+
+        unresolved = False
 
         for prefix, cid in pending:
-            result = await reconcile_order(
-                api,
-                ticker=entry[prefix + "_ticker"],
-                client_id=cid,
-                requested=D(str(entry[prefix + "_qty"])),
-                order_id=entry.get(prefix + "_order_id"),
-                side="ask",
-                allow_partial=True,
-            )
+            try:
+                result = await reconcile_order(
+                    api,
+                    ticker=entry[prefix + "_ticker"],
+                    client_id=cid,
+                    requested=D(str(entry[prefix + "_qty"])),
+                    order_id=entry.get(prefix + "_order_id"),
+                    side="ask",
+                    allow_partial=True,
+                )
+                if getattr(result, "terminal", False) is not True:
+                    raise RuntimeError(
+                        "Sell not proven terminal; no replacement"
+                    )
+            except Exception as exc:
+                entry["state"] = "RECONCILING"
+                entry["error"] = repr(exc)
+                journal.write()
+                unresolved = True
+                if on_log:
+                    on_log(
+                        f"LOSS SELL PENDING {key} "
+                        f"client_id={cid}; other cities continue: {exc}"
+                    )
+                break
+
             journal.update(
-                entry, "LOSS_SELL_RECONCILED",
+                entry,
+                "LOSS_SELL_RECONCILED",
                 **{
                     prefix + "_order_id": result.order_id,
-                    prefix + "_filled": (
-                        str(result.filled)
-                        if result.filled != int(result.filled)
-                        else int(result.filled)
-                    ),
+                    prefix + "_filled": str(result.filled),
                 },
             )
 
-        entry["state"] = "ACTIVE"
-        journal.write()
+        if not unresolved and not list(_pending_order_fields(entry)):
+            entry["state"] = "ACTIVE"
+            entry.pop("error", None)
+            journal.write()
+            if on_log:
+                on_log(
+                    f"LOSS SELL RECONCILED {key}; "
+                    "remaining shares eligible for liquidation"
+                )
+
 
 
 
@@ -153,13 +193,14 @@ def finish_loss_exit(journal, key, entry, legs, original):
 
 
 class LossMonitor:
-    def __init__(self, journal, *, enabled, quotes, positions, submit, log):
+    def __init__(self, journal, *, enabled, quotes, positions, submit, log, reconcile=None):
         self.journal = journal
         self.enabled = enabled
         self.quotes = quotes
         self.positions = positions
         self.submit = submit
         self.log = log
+        self.reconcile = reconcile
         self.below_since = {}
         self.next_attempt = {}
         self.shadow_fired = set()
@@ -243,8 +284,24 @@ class LossMonitor:
             if entry is not None and entry.get("state") == "DONE":
                 continue
 
-            if entry is not None and entry.get("state") != "ACTIVE":
-                raise RuntimeError(f"Unresolved loss exit {key}")
+            if entry is not None:
+                pending = list(_pending_order_fields(entry))
+
+                if pending:
+                    if (
+                        self.reconcile is not None
+                        and now >= self.next_attempt.get(key, 0)
+                    ):
+                        self.next_attempt[key] = now + RETRY_SECONDS
+                        await recover_loss_exits(
+                            api, self.journal, self.reconcile,
+                            keys={key}, on_log=self.log,
+                        )
+                    if list(_pending_order_fields(entry)):
+                        continue
+
+                if entry.get("state") != "ACTIVE":
+                    continue
 
             q = self._fresh(legs, books, last_seen, now)
             if q is None and entry is None:
@@ -290,10 +347,24 @@ class LossMonitor:
 
             self.next_attempt[key] = now + RETRY_SECONDS
 
-            await self._sell_once(
-                api, key, event, legs, original,
-                entry, books, last_seen,
-            )
+            try:
+                await self._sell_once(
+                    api, key, event, legs, original,
+                    entry, books, last_seen,
+                )
+            except Exception as exc:
+                if entry.get("state") == "ACTIVE":
+                    entry["state"] = (
+                        "RECONCILING"
+                        if list(_pending_order_fields(entry))
+                        else "HALTED"
+                    )
+                    entry["error"] = repr(exc)
+                    self.journal.write()
+                self.log(
+                    f"LOSS EXIT QUARANTINED {key}: {exc}; "
+                    "other cities continue"
+                )
 
     async def _sell_once(
         self, api, key, event, legs, original,
@@ -370,10 +441,18 @@ class LossMonitor:
                     reduce_only=True,
                 )
             except Exception as exc:
-                entry["state"] = "HALTED"
+                entry["state"] = (
+                    "RECONCILING"
+                    if list(_pending_order_fields(entry))
+                    else "HALTED"
+                )
                 entry["error"] = repr(exc)
                 self.journal.write()
-                raise
+                self.log(
+                    f"LOSS SELL UNRESOLVED {key} {ticker}: "
+                    f"{exc}; city quarantined"
+                )
+                return
 
             if verified is None:
                 self.log(
