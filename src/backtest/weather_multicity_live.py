@@ -771,8 +771,8 @@ class Journal:
         return pairs
 
     def entry_block_reason(self, op, args):
-        if outstanding_exits(self):
-            return 'protective exit unfinished'
+        if op.key in outstanding_exits(self):
+            return 'protective exit unfinished for this event'
         stopped = self.data.get("loss_exits", {}).get(op.key)
         if stopped is not None and (
             stopped.get("state") != "DONE"
@@ -1996,7 +1996,7 @@ async def ws_session(
 
                 # Keep order books updated while
                 # an HTTP execution task runs.
-                if execution is not None or exit_task is not None:
+                if execution is not None:
                     continue
 
                 code = owners[ticker]
@@ -2006,6 +2006,14 @@ async def ws_session(
                 event, market_tickers, _ = (
                     cities[code]
                 )
+                event_key = f'{code}:{event}'
+                if event_key in outstanding_exits(journal):
+                    continue
+                if (
+                    event_key in loss_manager.below_since
+                    and event_key not in journal.data.get('loss_exits', {})
+                ):
+                    continue  # Stop confirmation pending.
 
                 if len(journal.city_attempts_today(code)) >= args.max_city_attempts:
                     continue
