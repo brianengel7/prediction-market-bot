@@ -651,19 +651,8 @@ async def check_once():
             )
 
         if pending:
-            # Prevent tomorrow's scheduled startup while
-            # an unwind is still being reconciled.
-            subprocess.run(
-                [
-                    "systemctl",
-                    "disable",
-                    "--now",
-                    "weather-bot.timer",
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-            )
-
+            # The main trader quarantines pending GTC events.
+            # Keep its daily startup timer enabled.
             api = Kalshi()
 
             try:

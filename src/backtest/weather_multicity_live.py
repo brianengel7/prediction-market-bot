@@ -771,6 +771,12 @@ class Journal:
         return pairs
 
     def entry_block_reason(self, op, args):
+        if any(
+            a.get("key") == op.key
+            and a.get("status") not in SAFE_STATUSES
+            for a in self.data["attempts"]
+        ):
+            return "unfinished entry/unwind for this event"
         if op.key in outstanding_exits(self):
             return 'protective exit unfinished for this event'
         stopped = self.data.get("loss_exits", {}).get(op.key)
@@ -1078,6 +1084,141 @@ async def unwind_verified(
     return True
 
 
+
+def known_gtc_unwind(record):
+    return (
+        record.get("status") in {
+            "UNWIND_RESTING", "RECONCILING",
+        }
+        and record.get("unwind_time_in_force")
+        == "good_till_canceled"
+        and bool(record.get("unwind_client_id"))
+        and bool(record.get("unwind_order_id"))
+    )
+
+
+async def refresh_gtc_unwind(api, journal, record):
+    """Read-only exchange reconciliation; never POST a sell."""
+    from src.backtest.weather_unwind_watch import (
+        exchange_snapshot, classify, exact_order,
+        verify_order,
+    )
+
+    probe = dict(record)
+    probe["status"] = "UNWIND_RESTING"
+
+    orders, fills, positions = await exchange_snapshot(
+        api, probe
+    )
+    verdict, detail = classify(
+        probe, orders, fills, positions
+    )
+
+    key = record["key"]
+
+    if verdict == "READY":
+        journal.update(
+            record,
+            "UNWOUND",
+            unwind_filled=str(record["qty"]),
+            unwind_remaining="0",
+            auto_unwind_verified=True,
+        )
+        log(f"GTC UNWIND VERIFIED {key}; event unlocked")
+        return
+
+    if verdict != "PENDING":
+        raise RuntimeError(
+            f"Unrecognized GTC verdict {key}: {verdict}"
+        )
+
+    ticker = record["unwind_ticker"]
+    oid = record["unwind_order_id"]
+    sell = exact_order(
+        orders[ticker],
+        ticker,
+        order_id=oid,
+        client_id=record["unwind_client_id"],
+    )
+
+    if sell is None:
+        raise RuntimeError(
+            f"{key}: tracked GTC order not visible"
+        )
+
+    sold, remaining, status = verify_order(
+        sell, fills[oid], ticker, "sell",
+        D(str(record["qty"])),
+    )
+
+    if (
+        status not in ("resting", "pending")
+        or sold + remaining != D(str(record["qty"]))
+    ):
+        raise RuntimeError(
+            f"{key}: unexpected GTC order state"
+        )
+
+    # Verify held exposure matches the exact tracked sale.
+    for leg in record["legs"]:
+        baseline = D(str(record["pre_positions"][leg]))
+        expected = baseline + (
+            D(str(record["qty"])) - sold
+            if leg == ticker else D(0)
+        )
+        actual = D(str(positions[leg]))
+        if actual != expected:
+            raise RuntimeError(
+                f"{key}: position mismatch on {leg}: "
+                f"expected={expected} actual={actual}"
+            )
+
+    if (
+        record.get("status") != "UNWIND_RESTING"
+        or D(str(record.get("unwind_filled", 0))) != sold
+        or D(str(record.get("unwind_remaining", 0)))
+        != remaining
+    ):
+        journal.update(
+            record, "UNWIND_RESTING",
+            unwind_filled=str(sold),
+            unwind_remaining=str(remaining),
+        )
+
+    log(
+        f"GTC UNWIND PENDING {key}: "
+        f"sold={sold}, remaining={remaining}; "
+        "this event blocked, other cities continue"
+    )
+
+
+async def poll_open_gtc_unwinds(api, journal):
+    for record in journal.data["attempts"]:
+        if not known_gtc_unwind(record):
+            continue
+        try:
+            await refresh_gtc_unwind(api, journal, record)
+        except Exception as exc:
+            log(
+                f"GTC UNWIND QUARANTINED "
+                f"{record.get('key')}: {exc}; "
+                "other cities continue"
+            )
+
+
+async def risk_monitor_tick(
+    api, journal, loss_manager, cities, books, last_seen
+):
+    await loss_manager.tick(api, cities, books, last_seen)
+
+    now = time.monotonic()
+    last = getattr(journal, "_gtc_last_check", -1e12)
+
+    if now - last >= 30:
+        journal._gtc_last_check = now
+        await poll_open_gtc_unwinds(api, journal)
+
+
 async def recover_startup(api, journal):
     """Reconstruct unfinished trades before starting scanners."""
     unresolved = [
@@ -1095,6 +1236,17 @@ async def recover_startup(api, journal):
     )
 
     for record in unresolved:
+        if known_gtc_unwind(record):
+            try:
+                await refresh_gtc_unwind(api, journal, record)
+            except Exception as exc:
+                log(
+                    f"GTC STARTUP QUARANTINE "
+                    f"{record.get('key')}: {exc}; "
+                    "other cities remain eligible"
+                )
+            continue
+
         first, second = record["legs"]
         qty = int(record["qty"])
 
@@ -1587,6 +1739,16 @@ async def execute(
                 record,
             )
 
+            if (
+                not safe
+                and known_gtc_unwind(record)
+            ):
+                log(
+                    f"GTC UNWIND TRACKING {op.key}; "
+                    "other cities continue trading"
+                )
+                return True, False
+
             return True, not safe
 
         raise ReconciliationError(
@@ -1889,8 +2051,9 @@ async def ws_session(
                         and exit_task is None
                     ):
                         exit_task = asyncio.create_task(
-                            loss_manager.tick(
-                                api, cities, books, last_seen
+                            risk_monitor_tick(
+                                api, journal, loss_manager,
+                                cities, books, last_seen,
                             )
                         )
 
@@ -2506,6 +2669,7 @@ async def main():
                         if (
                             attempt.get("status")
                             not in SAFE_STATUSES
+                            and not known_gtc_unwind(attempt)
                         )
                     ]
 
