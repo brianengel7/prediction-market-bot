@@ -42,6 +42,10 @@ from src.backtest.weather_yes_basket_scanner import (
 )
 from src.backtest.weather_multicity_capacity_scanner import CITY
 from src.kalshi.fees import calculate_taker_fee
+from src.backtest.weather_loss_management import (
+    LossMonitor, held_cities, outstanding_exits,
+    recover_loss_exits,
+)
 
 
 ET = ZoneInfo("America/New_York")
@@ -447,6 +451,88 @@ class Kalshi:
             f"remaining={remaining}"
         )
 
+    async def ioc_sell(self, ticker, price, qty, client_id):
+        """Submit once; the response is NOT proof of a fill."""
+        qty = D(str(qty))
+
+        if (
+            not isinstance(ticker, str)
+            or not ticker
+            or not D(0) < D(str(price)) < ONE
+            or not qty.is_finite()
+            or qty < D("0.01")
+            or qty != qty.quantize(D("0.01"))
+        ):
+            raise ValueError("Invalid reduce-only IOC sell")
+
+        path = "/portfolio/events/orders"
+
+        body = {
+            "ticker": ticker,
+            "side": "ask",
+            "count": f"{qty:.2f}",
+            "price": f"{D(str(price)):.4f}",
+            "time_in_force": "immediate_or_cancel",
+            "client_order_id": client_id,
+            "self_trade_prevention_type": "taker_at_cross",
+            "cancel_order_on_pause": True,
+            "reduce_only": True,
+        }
+
+        log(
+            f"POST REDUCE-ONLY IOC SELL {ticker} "
+            f"qty={qty} limit={price} client_id={client_id}"
+        )
+
+        try:
+            response = await self.client.post(
+                self.base + path,
+                json=body,
+                headers=self.headers("POST", path),
+            )
+        except (
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ) as exc:
+            raise OrderUnknown(
+                f"IOC sell uncertain: {exc}"
+            ) from exc
+
+        if (
+            response.status_code in (408, 409, 429)
+            or response.status_code >= 500
+        ):
+            raise OrderUnknown(
+                f"IOC sell HTTP {response.status_code} uncertain"
+            )
+
+        if response.status_code != 201:
+            raise OrderRejected(
+                f"IOC sell HTTP {response.status_code}: "
+                f"{response.text[:350]}"
+            )
+
+        try:
+            data = response.json()
+            order = data.get("order", data)
+            order_id = order["order_id"]
+
+            if not isinstance(order_id, str) or not order_id:
+                raise ValueError("Missing order ID")
+
+        except (
+            KeyError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as exc:
+            raise OrderUnknown(
+                "IOC sell ACK incomplete; reconcile by client ID"
+            ) from exc
+
+        # Order fills must be independently verified.
+        return True, order_id
+
     async def gtc_sell(self, ticker, price, qty, client_id):
         """Submit one persistent YES limit sell, without retries."""
         price = D(str(price))
@@ -610,12 +696,35 @@ class Journal:
     def city_attempts_today(self, city):
         today = datetime.now(ET).date().isoformat()
         prefix = city + ":"
+        active = []
 
-        return [
-            a for a in self.data["attempts"]
-            if a.get("timestamp", "")[:10] == today
-            and a.get("key", "").startswith(prefix)
-        ]
+        for attempt in self.data["attempts"]:
+            stamp = attempt.get("timestamp", "")
+            key = attempt.get("key", "")
+
+            if stamp[:10] != today or not key.startswith(prefix):
+                continue
+
+            exit_record = self.data.get("loss_exits", {}).get(key)
+
+            if exit_record is not None and exit_record.get("state") == "DONE":
+                if exit_record.get("closure_verified") is not True:
+                    raise RuntimeError("Unverified city reset: " + key)
+
+                try:
+                    placed = datetime.fromisoformat(stamp)
+                    closed = datetime.fromisoformat(exit_record["closed_at"])
+                    if placed.tzinfo is None or closed.tzinfo is None:
+                        raise ValueError("Timezone missing")
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError("Invalid reset timestamp: " + key) from exc
+
+                if placed <= closed:
+                    continue
+
+            active.append(attempt)
+
+        return active
 
     def remaining_city_event_pairs(
         self, city, event, limit
@@ -662,6 +771,14 @@ class Journal:
         return pairs
 
     def entry_block_reason(self, op, args):
+        if outstanding_exits(self):
+            return 'protective exit unfinished'
+        stopped = self.data.get("loss_exits", {}).get(op.key)
+        if stopped is not None and (
+            stopped.get("state") != "DONE"
+            or stopped.get("closure_verified") is not True
+        ):
+            return "loss exit not fully verified; re-entry blocked"
         completed = self.completed_event_pairs(op.city, op.event)
 
         if len(completed) > 1:
@@ -756,17 +873,22 @@ async def submit_verified(
         **{prefix + "_client_id": client_id},
     )
 
+    if reduce_only and side != "ask":
+        raise ValueError(
+            "reduce_only only permitted for YES sells"
+        )
+
     order_id = None
 
     try:
-        _, order_id = await api.fok(
-            ticker,
-            side,
-            price,
-            qty,
-            client_id,
-            reduce_only=reduce_only,
-        )
+        if reduce_only:
+            _, order_id = await api.ioc_sell(
+                ticker, price, qty, client_id
+            )
+        else:
+            _, order_id = await api.fok(
+                ticker, side, price, qty, client_id,
+            )
 
     except OrderRejected as exc:
         journal.update(
@@ -793,6 +915,7 @@ async def submit_verified(
         requested=qty,
         order_id=order_id,
         side=side,
+        allow_partial=reduce_only,
     )
 
     journal.update(
@@ -800,7 +923,12 @@ async def submit_verified(
         prefix.upper() + "_VERIFIED",
         **{
             prefix + "_order_id": verified.order_id,
-            prefix + "_filled": verified.filled,
+            prefix + "_filled": (
+                str(verified.filled)
+                if reduce_only
+                and verified.filled != int(verified.filled)
+                else int(verified.filled)
+            ),
         },
     )
 
@@ -1583,6 +1711,14 @@ async def ws_session(
     live,
 ):
     active, waiting = time_gate(args.cities)
+    entry_active = list(active)
+    loss_mode = (
+        args.shadow_loss_exits or args.enable_loss_exits
+    )
+    if loss_mode:
+        active = sorted(
+            set(active) | held_cities(journal, args.cities)
+        )
 
     # Gate cities BEFORE discovery and subscriptions.
     if not active:
@@ -1623,7 +1759,7 @@ async def ws_session(
 
     current_active, waiting = time_gate(args.cities)
 
-    if current_active != active:
+    if current_active != entry_active:
         return False
 
     deadline = (
@@ -1653,6 +1789,17 @@ async def ws_session(
     sequence = {}
     signal_keys = {}
     execution = None
+    exit_task = None
+    loss_manager = (
+        LossMonitor(
+            journal,
+            enabled=args.enable_loss_exits,
+            quotes=quotes,
+            positions=positions_for_event,
+            submit=submit_verified,
+            log=log,
+        ) if loss_mode else None
+    )
 
     updates = 0
 
@@ -1727,12 +1874,16 @@ async def ws_session(
                         or (
                             args.one_trade
                             and attempted
+                            and not loss_mode
                         )
                     ):
                         return True
 
                     if attempted and live:
                         await api.balance()
+                if exit_task is not None and exit_task.done():
+                    await exit_task
+                    exit_task = None
 
                 # Scheduler operates outside the
                 # order-book evaluation hot path.
@@ -1741,6 +1892,15 @@ async def ws_session(
                     and now - maintenance >= 1
                 ):
                     maintenance = now
+                    if (
+                        loss_manager is not None
+                        and exit_task is None
+                    ):
+                        exit_task = asyncio.create_task(
+                            loss_manager.tick(
+                                api, cities, books, last_seen
+                            )
+                        )
 
                     if (
                         now >= deadline
@@ -1845,10 +2005,12 @@ async def ws_session(
 
                 # Keep order books updated while
                 # an HTTP execution task runs.
-                if execution is not None:
+                if execution is not None or exit_task is not None:
                     continue
 
                 code = owners[ticker]
+                if code not in entry_active:
+                    continue  # Exit monitoring only before 2 PM.
 
                 event, market_tickers, _ = (
                     cities[code]
@@ -1936,7 +2098,7 @@ async def ws_session(
                                 )
                             )
 
-                        elif args.one_trade:
+                        elif args.one_trade and not loss_mode:
                             log(
                                 "SHADOW ONE-TRADE candidate. "
                                 "No order submitted; stopping."
@@ -1949,6 +2111,8 @@ async def ws_session(
         finally:
             if execution is not None:
                 await asyncio.shield(execution)
+            if exit_task is not None:
+                await asyncio.shield(exit_task)
 
 
 def self_test():
@@ -2192,6 +2356,13 @@ async def main():
         "--self-test",
         action="store_true",
     )
+    loss_flags = parser.add_mutually_exclusive_group()
+    loss_flags.add_argument(
+        '--shadow-loss-exits', action='store_true'
+    )
+    loss_flags.add_argument(
+        '--enable-loss-exits', action='store_true'
+    )
 
 
     parser.add_argument(
@@ -2269,6 +2440,10 @@ async def main():
         "on",
     )
 
+    if args.shadow_loss_exits:
+        live = False
+    if args.enable_loss_exits and not live:
+        parser.error('Live exits require live trading enabled')
     claim_process_lock()
 
     try:
@@ -2302,6 +2477,14 @@ async def main():
         try:
             if live:
                 await recover_startup(api, journal)
+                if args.enable_loss_exits:
+                    await recover_loss_exits(
+                        api, journal, reconcile_order
+                    )
+                elif outstanding_exits(journal):
+                    raise RuntimeError(
+                        'Unfinished protective exit; refusing to trade'
+                    )
             cash = await api.balance()
 
             log(
@@ -2320,6 +2503,10 @@ async def main():
                     live
                     and journal.attempts_today()
                     >= args.max_daily_attempts
+                    and not (
+                        args.enable_loss_exits
+                        or args.shadow_loss_exits
+                    )
                 ):
                     log(
                         "Daily attempt limit reached. "
@@ -2352,7 +2539,11 @@ async def main():
                         )
                     ]
 
-                    if unresolved:
+                    unsafe_exits = [
+                        e for e in outstanding_exits(journal).values()
+                        if e.get('state') != 'ACTIVE'
+                    ]
+                    if unresolved or unsafe_exits:
                         raise RuntimeError(
                             "Unresolved exchange order. "
                             "Stop and reconcile manually."

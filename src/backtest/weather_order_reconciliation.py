@@ -119,8 +119,8 @@ class Execution:
     client_id: str
     order_id: str
     requested: int
-    filled: int
-    remaining: int
+    filled: Decimal | int
+    remaining: Decimal | int
     status: str
 
     @property
@@ -132,6 +132,16 @@ class Execution:
         )
 
     @property
+    def terminal(self):
+        return (
+            self.remaining == 0
+            and (
+                self.full
+                or self.status in {"canceled", "cancelled"}
+            )
+        )
+
+    @property
     def unfilled(self):
         return (
             self.status in {"canceled", "cancelled"}
@@ -140,7 +150,26 @@ class Execution:
         )
 
 
-def validate_order(order, ticker, client_id, requested, side):
+def fixed_qty(value):
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ReconciliationError("Invalid fixed-point quantity") from exc
+
+    if (
+        not number.is_finite()
+        or number < 0
+        or number != number.quantize(Decimal("0.01"))
+    ):
+        raise ReconciliationError("Invalid fixed-point precision")
+
+    return number
+
+
+def validate_order(
+    order, ticker, client_id, requested, side,
+    *, allow_partial=False,
+):
     if (
         order.get("ticker") != ticker
         or order.get("client_order_id") != client_id
@@ -166,12 +195,19 @@ def validate_order(order, ticker, client_id, requested, side):
             "Cannot verify order direction"
         )
 
-    filled = count(
-        order, "fill_count_fp", "fill_count"
-    )
-    remaining = count(
-        order, "remaining_count_fp", "remaining_count"
-    )
+    if allow_partial:
+        filled = fixed_qty(next(
+            (order[n] for n in ("fill_count_fp", "fill_count")
+             if order.get(n) is not None), None
+        ))
+        remaining = fixed_qty(next(
+            (order[n] for n in ("remaining_count_fp", "remaining_count")
+             if order.get(n) is not None), None
+        ))
+        requested = fixed_qty(requested)
+    else:
+        filled = count(order, "fill_count_fp", "fill_count")
+        remaining = count(order, "remaining_count_fp", "remaining_count")
     status = str(order.get("status", "")).lower()
 
     if (
@@ -187,7 +223,7 @@ def validate_order(order, ticker, client_id, requested, side):
             "Order quantity exceeds requested"
         )
 
-    if 0 < filled < requested:
+    if 0 < filled < requested and not allow_partial:
         raise ReconciliationError(
             "Unexpected partial FOK fill"
         )
@@ -197,7 +233,11 @@ def validate_order(order, ticker, client_id, requested, side):
             "Executed order is not fully filled"
         )
 
-    if status in {"canceled", "cancelled"} and filled != 0:
+    if (
+        status in {"canceled", "cancelled"}
+        and filled != 0
+        and not allow_partial
+    ):
         raise ReconciliationError(
             "Canceled order partially filled"
         )
@@ -211,13 +251,21 @@ async def reconcile_once(
     client_id,
     requested,
     order_id=None,
-    side="bid",
+    side="bid", allow_partial=False,
 ):
     if (
-        not ticker
-        or not client_id
-        or not isinstance(requested, int)
-        or requested < 1
+        not ticker or not client_id
+        or (
+            not allow_partial
+            and (
+                not isinstance(requested, int)
+                or requested < 1
+            )
+        )
+        or (
+            allow_partial
+            and fixed_qty(requested) < Decimal("0.01")
+        )
     ):
         raise ReconciliationError(
             "Incomplete saved order identity"
@@ -270,7 +318,8 @@ async def reconcile_once(
         )
 
     filled, remaining, status = validate_order(
-        order, ticker, client_id, requested, side
+        order, ticker, client_id, requested, side,
+        allow_partial=allow_partial,
     )
 
     fills = await paged(
@@ -294,7 +343,11 @@ async def reconcile_once(
                 "Fill identity mismatch"
             )
 
-        if fill.get("side") not in (None, "yes"):
+        if fill.get("side") not in (
+            (None, "yes", "no")
+            if allow_partial and side == "ask"
+            else (None, "yes")
+        ):
             raise ReconciliationError(
                 "Unexpected NO fill for YES basket"
             )
@@ -346,6 +399,7 @@ async def reconcile_once(
 async def reconcile_order(
     api, *, ticker, client_id, requested,
     order_id=None, side="bid", book_side=None, tries=12,
+    allow_partial=False,
 ):
     """Read-only verification with order-list fallback."""
     if book_side is not None:
@@ -355,7 +409,14 @@ async def reconcile_order(
         side not in ("bid", "ask")
         or not client_id
         or not ticker
-        or requested < 1
+        or (
+            allow_partial
+            and fixed_qty(requested) < Decimal("0.01")
+        )
+        or (
+            not allow_partial
+            and requested < 1
+        )
     ):
         raise ReconciliationError(
             "Invalid reconciliation identity"
@@ -382,6 +443,7 @@ async def reconcile_order(
                     requested=requested,
                     order_id=lookup_id,
                     side=side,
+                    allow_partial=allow_partial,
                 )
 
                 if (
