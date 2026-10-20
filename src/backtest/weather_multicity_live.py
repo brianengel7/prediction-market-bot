@@ -1712,13 +1712,10 @@ async def ws_session(
 ):
     active, waiting = time_gate(args.cities)
     entry_active = list(active)
-    loss_mode = (
-        args.shadow_loss_exits or args.enable_loss_exits
+    # Loss monitoring is built into the normal bot.
+    active = sorted(
+        set(active) | held_cities(journal, args.cities)
     )
-    if loss_mode:
-        active = sorted(
-            set(active) | held_cities(journal, args.cities)
-        )
 
     # Gate cities BEFORE discovery and subscriptions.
     if not active:
@@ -1790,15 +1787,13 @@ async def ws_session(
     signal_keys = {}
     execution = None
     exit_task = None
-    loss_manager = (
-        LossMonitor(
-            journal,
-            enabled=args.enable_loss_exits,
-            quotes=quotes,
-            positions=positions_for_event,
-            submit=submit_verified,
-            log=log,
-        ) if loss_mode else None
+    loss_manager = LossMonitor(
+        journal,
+        enabled=live,
+        quotes=quotes,
+        positions=positions_for_event,
+        submit=submit_verified,
+        log=log,
     )
 
     updates = 0
@@ -1871,11 +1866,7 @@ async def ws_session(
 
                     if (
                         danger
-                        or (
-                            args.one_trade
-                            and attempted
-                            and not loss_mode
-                        )
+                        or (args.one_trade and attempted)
                     ):
                         return True
 
@@ -2098,7 +2089,7 @@ async def ws_session(
                                 )
                             )
 
-                        elif args.one_trade and not loss_mode:
+                        elif args.one_trade:
                             log(
                                 "SHADOW ONE-TRADE candidate. "
                                 "No order submitted; stopping."
@@ -2356,13 +2347,6 @@ async def main():
         "--self-test",
         action="store_true",
     )
-    loss_flags = parser.add_mutually_exclusive_group()
-    loss_flags.add_argument(
-        '--shadow-loss-exits', action='store_true'
-    )
-    loss_flags.add_argument(
-        '--enable-loss-exits', action='store_true'
-    )
 
 
     parser.add_argument(
@@ -2440,10 +2424,6 @@ async def main():
         "on",
     )
 
-    if args.shadow_loss_exits:
-        live = False
-    if args.enable_loss_exits and not live:
-        parser.error('Live exits require live trading enabled')
     claim_process_lock()
 
     try:
@@ -2477,14 +2457,9 @@ async def main():
         try:
             if live:
                 await recover_startup(api, journal)
-                if args.enable_loss_exits:
-                    await recover_loss_exits(
-                        api, journal, reconcile_order
-                    )
-                elif outstanding_exits(journal):
-                    raise RuntimeError(
-                        'Unfinished protective exit; refusing to trade'
-                    )
+                await recover_loss_exits(
+                    api, journal, reconcile_order
+                )
             cash = await api.balance()
 
             log(
@@ -2498,22 +2473,8 @@ async def main():
                 f"{args.max_daily_attempts}"
             )
 
+            # Keep monitoring owned positions after entry limits.
             while True:
-                if (
-                    live
-                    and journal.attempts_today()
-                    >= args.max_daily_attempts
-                    and not (
-                        args.enable_loss_exits
-                        or args.shadow_loss_exits
-                    )
-                ):
-                    log(
-                        "Daily attempt limit reached. "
-                        "Stopping."
-                    )
-                    break
-
                 try:
                     stop = await ws_session(
                         args,
