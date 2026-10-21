@@ -2164,6 +2164,12 @@ async def ws_session(
                     continue
 
                 code = owners[ticker]
+
+                # Denver temporarily disabled until winter.
+                # Keep subscriptions for existing-position protection.
+                if code == "DEN":
+                    continue
+
                 if code not in entry_active:
                     continue  # Exit monitoring only before 2 PM.
 
