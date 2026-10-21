@@ -63,6 +63,7 @@ SAFE_STATUSES = {
     "FIRST_UNFILLED",
     "UNWOUND",
     "NOT_SUBMITTED",
+    "SETTLED",
 }
 
 
@@ -1101,7 +1102,7 @@ async def refresh_gtc_unwind(api, journal, record):
     """Read-only exchange reconciliation; never POST a sell."""
     from src.backtest.weather_unwind_watch import (
         exchange_snapshot, classify, exact_order,
-        verify_order,
+        verify_order, SafetyHold, paged,
     )
 
     probe = dict(record)
@@ -1110,11 +1111,117 @@ async def refresh_gtc_unwind(api, journal, record):
     orders, fills, positions = await exchange_snapshot(
         api, probe
     )
-    verdict, detail = classify(
-        probe, orders, fills, positions
-    )
-
     key = record["key"]
+
+    try:
+        verdict, detail = classify(
+            probe, orders, fills, positions
+        )
+
+    except SafetyHold as exc:
+        # A canceled GTC is not a completed sale.
+        # Archive only when the remaining contracts
+        # are independently proven settled by Kalshi.
+        if not str(exc).startswith(
+            "GTC not fully executed:"
+        ):
+            raise
+
+        ticker = record["unwind_ticker"]
+        order_id = record["unwind_order_id"]
+
+        sell = exact_order(
+            orders[ticker],
+            ticker,
+            order_id=order_id,
+            client_id=record["unwind_client_id"],
+        )
+
+        if sell is None:
+            raise SafetyHold(
+                "Cannot find original GTC sell"
+            )
+
+        sold, remaining, status = verify_order(
+            sell,
+            fills[order_id],
+            ticker,
+            "sell",
+            D(str(record["qty"])),
+        )
+
+        if (
+            status not in ("canceled", "cancelled")
+            or remaining != 0
+        ):
+            raise
+
+        event = key.split(":", 1)[1]
+
+        settlements = await paged(
+            api,
+            "/portfolio/settlements",
+            "settlements",
+            {"ticker": ticker, "limit": 200},
+        )
+
+        baseline = D(str(
+            record["pre_positions"][ticker]
+        ))
+
+        expected_settled = (
+            baseline
+            + D(str(record["qty"]))
+            - sold
+        )
+
+        matching = [
+            item for item in settlements
+            if item.get("ticker") == ticker
+            and item.get("event_ticker") == event
+            and item.get("settled_time")
+            and D(str(item.get(
+                "yes_count_fp", "-1"
+            ))) == expected_settled
+        ]
+
+        if len(matching) != 1:
+            raise SafetyHold(
+                f"Settlement not yet verified: {key}"
+            )
+
+        if any(
+            D(str(positions.get(leg, 0))) != 0
+            for leg in record["legs"]
+        ):
+            raise SafetyHold(
+                "Settled event still shows open position"
+            )
+
+        settlement = matching[0]
+
+        journal.update(
+            record,
+            "SETTLED",
+            unwind_filled=str(sold),
+            unwind_remaining="0",
+            settlement_verified=True,
+            settled_contracts=str(
+                D(str(record["qty"])) - sold
+            ),
+            settlement_time=settlement["settled_time"],
+            settlement_result=settlement.get(
+                "market_result"
+            ),
+        )
+
+        log(
+            f"GTC SETTLED {key}: "
+            f"original sell filled={sold}; "
+            f"remaining contracts settled; "
+            "historical quarantine archived"
+        )
+        return
 
     if verdict == "READY":
         journal.update(
