@@ -345,7 +345,7 @@ async def reconcile_once(
 
         if fill.get("side") not in (
             (None, "yes", "no")
-            if allow_partial and side == "ask"
+            if side == "ask"
             else (None, "yes")
         ):
             raise ReconciliationError(
