@@ -328,6 +328,18 @@ class Kalshi:
             cash = usd(data["balance"]) / 100
 
         self.cached_balance = cash
+        self.balance_checked_at = time.monotonic()
+        return cash
+
+    async def available_balance(self):
+        cash = getattr(self, "cached_balance", None)
+        age = time.monotonic() - getattr(
+            self, "balance_checked_at", 0.0
+        )
+
+        if cash is None or age >= 10.0:
+            return await self.balance()
+
         return cash
 
     async def fok(
@@ -1589,10 +1601,7 @@ async def execute(
         )
         return False, False
 
-    cash = getattr(api, "cached_balance", None)
-
-    if cash is None:
-        cash = await api.balance()
+    cash = await api.available_balance()
 
     if cash < op.allin:
         log(f"{op.city}: insufficient cash; no orders sent")
