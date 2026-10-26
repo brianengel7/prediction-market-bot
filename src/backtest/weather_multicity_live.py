@@ -57,6 +57,7 @@ LOCK_FILE = Path(".weather_multicity_live_process.lock")
 TOP_TWO_MIN = D("0.75")
 BASKET_CAP = D("0.96")
 ONE = D("1")
+MAX_LIQUIDITY_FRACTION = D("0.75")
 
 SAFE_STATUSES = {
     "COMPLETE",
@@ -197,8 +198,12 @@ def evaluate(
     if ask_total >= BASKET_CAP:
         return None
 
-    # Available pairs at the current best YES asks.
-    depth = int(min(first[3], second[3]))
+    # Use at most 75% of executable best-ask liquidity.
+    # The shallower leg determines paired capacity.
+    depth = int(
+        min(first[3], second[3])
+        * MAX_LIQUIDITY_FRACTION
+    )
 
     if depth < 1:
         return None
