@@ -1192,9 +1192,12 @@ async def refresh_gtc_unwind(api, journal, record):
             if item.get("ticker") == ticker
             and item.get("event_ticker") == event
             and item.get("settled_time")
-            and D(str(item.get(
-                "yes_count_fp", "-1"
-            ))) == expected_settled
+            and item.get("yes_count_fp") is not None
+            and item.get("no_count_fp") is not None
+            and (
+                D(str(item["yes_count_fp"]))
+                - D(str(item["no_count_fp"]))
+            ) == expected_settled
         ]
 
         if len(matching) != 1:
