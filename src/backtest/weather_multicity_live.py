@@ -2651,7 +2651,7 @@ async def main():
     parser.add_argument(
         "--city-cooldown-minutes",
         type=D,
-        default=D("10"),
+        default=D("0"),
         help="Minutes between entries in same city",
     )
 
