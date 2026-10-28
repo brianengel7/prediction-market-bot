@@ -197,40 +197,35 @@ def evaluate(
     if ask_total >= BASKET_CAP:
         return None
 
-    # Available pairs at the current best YES asks.
-    depth = int(min(first[3], second[3]))
+    # Fixed 10-contract basket strategy.
+    # Both legs must offer at least 10 contracts
+    # at their current best executable YES ask.
+    qty = 10
 
-    if depth < 1:
+    if max_pairs < qty:
         return None
 
-    largest = min(
-        depth,
-        1 if one_trade else max_pairs,
+    if first[3] < qty or second[3] < qty:
+        return None
+
+    cost = (
+        ask_total * qty
+        + fee(asks[0], qty)
+        + fee(asks[1], qty)
     )
 
-    # Choose the largest quantity satisfying every cap.
-    for qty in range(largest, 0, -1):
-        cost = (
-            ask_total * qty
-            + fee(asks[0], qty)
-            + fee(asks[1], qty)
-        )
+    if cost > max_cost or cost >= D(qty):
+        return None
 
-        if (
-            cost <= max_cost
-            and cost < D(qty)
-        ):
-            return Opportunity(
-                city=city,
-                event=event,
-                legs=legs,
-                asks=asks,
-                mids=mids,
-                qty=qty,
-                allin=cost,
-            )
-
-    return None
+    return Opportunity(
+        city=city,
+        event=event,
+        legs=legs,
+        asks=asks,
+        mids=mids,
+        qty=qty,
+        allin=cost,
+    )
 
 
 class OrderUnknown(RuntimeError):
@@ -2458,7 +2453,7 @@ def self_test():
         )
 
         assert one is not None
-        assert one.qty == 1
+        assert one.qty == 10
         assert one.mids == D(".82")
 
         normal = evaluate(
@@ -2467,12 +2462,12 @@ def self_test():
             books,
             tuple(books),
             one_trade=False,
-            max_pairs=7,
+            max_pairs=10,
             max_cost=D("20"),
         )
 
         assert normal is not None
-        assert normal.qty == 7
+        assert normal.qty == 10
 
     # Check compatibility with installed Book/scan.
     real_books = {}
@@ -2509,7 +2504,7 @@ def self_test():
         )
 
         assert integration is not None
-        assert integration.qty == 1
+        assert integration.qty == 10
 
     except Exception as exc:
         raise RuntimeError(
@@ -2518,8 +2513,8 @@ def self_test():
         ) from exc
 
     print(
-        "PASS: one-trade=1 pair; "
-        "normal dynamic sizing; "
+        "PASS: fixed 10-contract baskets; "
+        "minimum 10 contracts per leg; "
         "75% midpoint; cost cap"
     )
     print(
