@@ -1,0 +1,4 @@
+assumed_delay_minutes,candidate_contract_event_pairs,usable_contract_event_pairs,usable_events,usable_days,mean_abs_mid_change,mean_abs_mid_change_new_observed_high,mean_all_bucket_yes_roundtrip_gross
+0,21882,11418,3158,118,0.0086,0.010941,-0.01493
+5,21882,11233,3126,118,0.01616,0.025062,-0.014818
+10,21882,11602,3127,118,0.00913,0.012262,-0.014822

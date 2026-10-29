@@ -1,0 +1,5 @@
+model,n,MAE_F,within_0.5F,within_1F,within_2F
+previous_hourly_report,438,1.187,0.283,0.699,0.879
+latest_archived_minute,438,0.272,0.735,0.995,0.998
+minute_linear_trend,438,0.434,0.712,0.856,0.995
+boosted_model,438,0.341,0.733,0.941,0.998
