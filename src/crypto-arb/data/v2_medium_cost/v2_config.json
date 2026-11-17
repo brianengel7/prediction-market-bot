@@ -1,0 +1,18 @@
+{
+  "command": "analyze",
+  "data_dir": "src/crypto-arb/data",
+  "output_dir": "src/crypto-arb/data/v2_medium_cost",
+  "symbols": "BTC-USD,ETH-USD,SOL-USD,LINK-USD,AVAX-USD,ADA-USD,XRP-USD,DOGE-USD,LTC-USD,AAVE-USD",
+  "granularity": 3600,
+  "train_fraction": 0.7,
+  "min_coverage": 0.97,
+  "lookbacks": "3,6,12",
+  "holds": "4,12,24",
+  "thresholds": "1.5,2.0",
+  "fee_bps": 15.0,
+  "slippage_bps": 5.0,
+  "carry_bps_day": 0.0,
+  "min_corr": 0.55,
+  "min_train_trades": 15,
+  "top": 15
+}

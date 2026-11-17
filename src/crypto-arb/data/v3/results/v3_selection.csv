@@ -1,0 +1,2 @@
+symbol,status,tested_params,train_hours,test_hours,hold_h,min_basis_bps,min_trailing_funding_bps_per_event,train_trades,train_breaches,train_avg_net_bps,train_lower95_bps_heuristic,oos_trades,oos_breaches,oos_avg_net_bps,oos_net_usd_total,oos_win_rate
+BTCUSDT,NO_TRAIN_EDGE,27,3091,1325,48,0.0,0.0,4,0,-31.161317476307886,-32.66404535981509,0,0,,,

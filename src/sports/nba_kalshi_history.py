@@ -1,0 +1,347 @@
+"""Read-only KXNBAGAME historical pre-tipoff quote study.
+
+Two modes:
+  collect  = cache archived Kalshi market discovery and 1-minute quotes;
+             create a game-linked indicative (not executable) snapshot CSV.
+  evaluate = combine snapshots with out-of-sample model predictions and
+             calculate *indicative* after-fee hold-to-settlement P&L.
+
+No orders, keys, account requests, or live market mutations.
+Candlestick closes never establish historical fillable order-book depth.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from src.kalshi.fees import calculate_taker_fee
+from src.sports.nba_value_model import canonical_team, load_games, parse_time, NBA_TEAMS
+
+BASE = "https://api.elections.kalshi.com/trade-api/v2"
+SERIES = "KXNBAGAME"
+OUTPUT = Path("data/sports/nba_kalshi_pregame_quotes.csv")
+CACHE = Path("data/sports/kalshi_nba_history_cache")
+FIELDS = ("game_id", "date", "home", "away", "home_won", "ticker", "yes_team",
+          "quote_time", "age_seconds", "yes_bid", "yes_ask", "home_yes_ask",
+          "away_yes_ask", "spread", "market_result", "fee_multiplier", "fee_type")
+
+
+def session_with_retries() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "User-Agent": "nba-value-research/1.0"})
+    retry = Retry(total=4, connect=4, read=4, backoff_factor=0.7,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({"GET"}))
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def get_json(session: requests.Session, path: str, params: dict | None = None) -> dict:
+    response = session.get(BASE + path, params=params, timeout=30)
+    if not response.ok:
+        raise RuntimeError(
+            f"Kalshi GET {response.url} returned HTTP "
+            f"{response.status_code}: {response.text[:1000]}"
+        )
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"Unexpected response from {path}")
+    return data
+
+
+def store_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_or_get(session: requests.Session, path: Path, api: str, params: dict | None = None) -> dict:
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    data = get_json(session, api, params)
+    store_json(path, data)
+    return data
+
+
+def discover_markets(session: requests.Session, cache: Path) -> list[dict]:
+    """Archive-only discovery. Must fetch every page; reject truncated caches."""
+    path = cache / "historical_kxnbagame_markets.json"
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list) and all(isinstance(m, dict) for m in data):
+            return data
+        raise ValueError("Market cache corrupt")
+    result = []
+    cursor = ""
+    seen = set()
+    for page_num in range(1, 101):
+        args = {"series_ticker": SERIES, "limit": 1000}
+        if cursor:
+            args["cursor"] = cursor
+        data = get_json(session, "/historical/markets", args)
+        markets = data.get("markets")
+        if not isinstance(markets, list):
+            raise ValueError("Historical market discovery returned no markets[]")
+        result.extend(markets)
+        cursor = data.get("cursor") or ""
+        if not cursor:
+            store_json(path, result)
+            return result
+        if cursor in seen:
+            raise ValueError("Repeated pagination cursor")
+        seen.add(cursor)
+        print(f"Market discovery page {page_num}: {len(result)} markets", flush=True)
+    raise RuntimeError("Archive pagination unexpectedly exceeded 100 pages")
+
+
+def parse_market(market: dict) -> tuple[date, frozenset[str], str] | None:
+    """Require a regular two-team event ticker; never infer from market titles alone."""
+    ticker = str(market.get("ticker") or "").upper()
+    match = re.fullmatch(r"KXNBAGAME-(\d\d[A-Z]{3}\d\d)([A-Z]{4,9})-([A-Z]{2,5})", ticker)
+    if not match:
+        return None
+    try:
+        game_date = datetime.strptime(match.group(1), "%y%b%d").date()
+    except ValueError:
+        return None
+    combined, yes_code = match.group(2), match.group(3)
+    yes_team = canonical_team(yes_code)
+    possible = set()
+    for pos in range(2, len(combined) - 1):
+        left, right = canonical_team(combined[:pos]), canonical_team(combined[pos:])
+        if left != right and left in NBA_TEAMS and right in NBA_TEAMS:
+            possible.add(frozenset((left, right)))
+    if len(possible) != 1:
+        return None
+    teams = next(iter(possible))
+    if yes_team not in teams:
+        return None
+    return game_date, teams, yes_team
+
+
+def quote_from_candles(candles: list, cutoff: datetime, max_age_s: int,
+                       max_spread: float) -> dict | None:
+    """Use the last fully completed one-minute candle before decision time."""
+    cutoff_ts = int(cutoff.timestamp())
+    candidates = []
+    for candle in candles:
+        try:
+            end = int(candle["end_period_ts"])
+            age = cutoff_ts - end
+            if age < 0 or age > max_age_s:
+                continue
+            bid = float(candle["yes_bid"]["close"])
+            ask = float(candle["yes_ask"]["close"])
+            spread = ask - bid
+            if not (0 < bid <= ask < 1 and 0 <= spread <= max_spread):
+                continue
+            candidates.append((end, bid, ask, age, spread))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    if not candidates:
+        return None
+    end, bid, ask, age, spread = max(candidates, key=lambda x: x[0])
+    return {"quote_time": datetime.fromtimestamp(end, tz=timezone.utc).isoformat(),
+            "yes_bid": bid, "yes_ask": ask, "age_seconds": age, "spread": spread}
+
+
+def fetch_quote(session: requests.Session, cache: Path, ticker: str,
+                cutoff: datetime, max_age_s: int, max_spread: float) -> dict | None:
+    safe_ticker = re.fullmatch(r"KXNBAGAME-[A-Z0-9-]+", ticker)
+    if not safe_ticker:
+        return None
+    # Include cache window and cutoff timestamp in key to avoid reusing a different sampling plan.
+    finish = int(cutoff.timestamp())
+    begin = finish - max_age_s - 120
+    path = cache / "candles" / f"{ticker}_{begin}_{finish}.json"
+    data = load_or_get(session, path, f"/historical/markets/{ticker}/candlesticks",
+                       {"start_ts": begin, "end_ts": finish, "period_interval": 1})
+    candles = data.get("candlesticks")
+    if not isinstance(candles, list):
+        raise ValueError(f"Malformed candle response for {ticker}")
+    return quote_from_candles(candles, cutoff, max_age_s, max_spread)
+
+
+def collect(args: argparse.Namespace) -> None:
+    session = session_with_retries()
+    markets = discover_markets(session, args.cache)
+    indexed: dict[tuple[date, frozenset[str]], list[tuple[dict, str]]] = defaultdict(list)
+    for market in markets:
+        parsed = parse_market(market)
+        if parsed is None:
+            continue
+        d, teams, yes_team = parsed
+        indexed[(d, teams)].append((market, yes_team))
+    print(f"Archive markets={len(markets)}, game-date/team pairs={len(indexed)}", flush=True)
+
+    series = get_json(session, f"/series/{SERIES}").get("series") or {}
+    fee_type = series.get("fee_type")
+    fee_multiplier = series.get("fee_multiplier")
+    if fee_type not in {"quadratic", "quadratic_with_maker_fees"} or fee_multiplier is None:
+        raise ValueError("Unrecognized current series fee settings; cannot estimate trading costs")
+    fee_multiplier = float(fee_multiplier)
+    if not 0 <= fee_multiplier <= 1:
+        raise ValueError(f"Invalid series fee multiplier: {fee_multiplier}")
+    print(f"Current series fee assumption: {fee_type}, multiplier={fee_multiplier}."
+          " Historical event overrides are NOT verified.", flush=True)
+
+    games = [g for g in load_games(args.games) if args.start <= g["date"] <= args.end]
+    if args.limit_games:
+        games = games[:args.limit_games]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    counts = Counter()
+    for ix, game in enumerate(games, start=1):
+        key = (game["date"], frozenset((game["home"], game["away"])))
+        choices = indexed.get(key) or []
+        if not choices:
+            counts["unmatched"] += 1
+            continue
+        if len({m.get("event_ticker") for m, _ in choices}) != 1:
+            counts["ambiguous_events"] += 1
+            continue
+        target = game["start_time"] - timedelta(minutes=args.minutes_before)
+        market_quotes = []
+        for market, yes_team in choices:
+            result = str(market.get("result") or "").lower()
+            if result not in {"yes", "no"}:
+                counts["unresolved"] += 1
+                continue
+            yes_won = (game["home_score"] > game["away_score"]) == (yes_team == game["home"])
+            if (result == "yes") != yes_won:
+                counts["result_mismatch"] += 1
+                continue
+            ticker = str(market.get("ticker") or "")
+            quote = fetch_quote(session, args.cache, ticker, target, args.max_age_seconds,
+                                args.max_spread)
+            if quote is not None:
+                market_quotes.append((quote["spread"], quote["age_seconds"], ticker,
+                                      yes_team, result, quote))
+        if not market_quotes:
+            counts["missing_fresh_two_sided_quote"] += 1
+            continue
+        _, _, ticker, yes_team, result, quote = min(market_quotes)
+        bid, ask = quote["yes_bid"], quote["yes_ask"]
+        home_yes_ask = ask if yes_team == game["home"] else 1 - bid
+        away_yes_ask = ask if yes_team == game["away"] else 1 - bid
+        rows.append({"game_id": game["game_id"], "date": game["date"],
+                     "home": game["home"], "away": game["away"],
+                     "home_won": int(game["home_score"] > game["away_score"]),
+                     "ticker": ticker, "yes_team": yes_team,
+                     "quote_time": quote["quote_time"], "age_seconds": quote["age_seconds"],
+                     "yes_bid": bid, "yes_ask": ask, "home_yes_ask": home_yes_ask,
+                     "away_yes_ask": away_yes_ask, "spread": quote["spread"],
+                     "market_result": result, "fee_multiplier": fee_multiplier,
+                     "fee_type": fee_type})
+        counts["matched"] += 1
+        if ix % 25 == 0:
+            write_csv(args.output, rows)
+            print(f"{ix}/{len(games)} checked; {counts['matched']} snapshots", flush=True)
+    write_csv(args.output, rows)
+    print(f"Saved {len(rows)} indicative pregame snapshots to {args.output}")
+    print("Coverage:", dict(counts))
+    print("IMPORTANT: Candles contain no order-book depth, and quote timestamps are bar ends."
+          " Actual taker fills and historical fee overrides are not established.")
+
+
+def write_csv(path: Path, rows: list[dict]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(path)
+
+
+def evaluate(args: argparse.Namespace) -> None:
+    if args.quantity < 1 or not 0 <= args.min_roi < 10:
+        raise ValueError("Invalid quantity or minimum ROI")
+    with args.predictions.open(newline="", encoding="utf-8") as f:
+        predictions = {r["game_id"]: r for r in csv.DictReader(f)}
+    with args.quotes.open(newline="", encoding="utf-8") as f:
+        quotes = list(csv.DictReader(f))
+    candidates = []
+    for quote in quotes:
+        p = predictions.get(quote["game_id"])
+        if p is None:
+            continue
+        if p["home"] != quote["home"] or p["away"] != quote["away"]:
+            raise ValueError(f"Team mismatch on {quote['game_id']}")
+        if p["home_won"] != quote["home_won"]:
+            raise ValueError(f"Outcome mismatch on {quote['game_id']}")
+        values = {}
+        for name, column in (("elo", "elo_p"), ("statistical", "model_p")):
+            model_home = float(p[column])
+            if not 0 < model_home < 1:
+                continue
+            offers = []
+            for side, probability, won in (("home", model_home, int(p["home_won"])),
+                                           ("away", 1-model_home, 1-int(p["home_won"]))):
+                ask = float(quote[f"{side}_yes_ask"])
+                fee = calculate_taker_fee(ask, args.quantity, float(quote["fee_multiplier"]))
+                cost = args.quantity * ask + fee
+                ev = args.quantity * probability - cost
+                roi = ev / cost
+                if ev > 0 and roi >= args.min_roi:
+                    offers.append((ev, side, cost, roi, args.quantity * won - cost))
+            if offers:
+                values[name] = max(offers, key=lambda x: x[0])
+        candidates.append((quote, values))
+    print(f"Predictions: {len(predictions)}; quoted games: {len(quotes)}; "
+          f"matched to predictions: {len(candidates)}")
+    for model in ("elo", "statistical"):
+        picks = [(q, v[model]) for q, v in candidates if model in v]
+        cost = sum(pick[2] for _, pick in picks)
+        pnl = sum(pick[4] for _, pick in picks)
+        expected = sum(pick[0] for _, pick in picks)
+        print(f"{model:12} trades={len(picks):4d} "
+              f"indicative_cost=${cost:.2f} expected_PnL=${expected:+.2f} "
+              f"indicative_PnL=${pnl:+.2f} "
+              f"indicative_ROI={pnl / cost:+.2%}" if cost else
+              f"{model:12} trades=0, no qualifying opportunities")
+    print("INDICATIVE ONLY: quoted candle asks do not verify historical depth, fills,"
+          " fee overrides, or quote availability at the exact decision second.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    collect_cmd = sub.add_parser("collect")
+    collect_cmd.add_argument("--games", type=Path, default=Path("data/sports/nba_games.csv"))
+    collect_cmd.add_argument("--start", type=date.fromisoformat, default=date(2025, 10, 21))
+    collect_cmd.add_argument("--end", type=date.fromisoformat, default=date(2026, 4, 12))
+    collect_cmd.add_argument("--minutes-before", type=int, default=30)
+    collect_cmd.add_argument("--max-age-seconds", type=int, default=300)
+    collect_cmd.add_argument("--max-spread", type=float, default=0.08)
+    collect_cmd.add_argument("--limit-games", type=int, default=10, help="0 for all season games")
+    collect_cmd.add_argument("--cache", type=Path, default=CACHE)
+    collect_cmd.add_argument("--output", type=Path, default=OUTPUT)
+    eval_cmd = sub.add_parser("evaluate")
+    eval_cmd.add_argument("--predictions", type=Path, default=Path("data/sports/nba_value_test_predictions.csv"))
+    eval_cmd.add_argument("--quotes", type=Path, default=OUTPUT)
+    eval_cmd.add_argument("--quantity", type=int, default=10)
+    eval_cmd.add_argument("--min-roi", type=float, default=0.05)
+    args = parser.parse_args()
+    if args.command == "collect":
+        if args.minutes_before < 1 or args.max_age_seconds < 0 or not 0 <= args.max_spread <= 1:
+            parser.error("Invalid candle filter arguments")
+        collect(args)
+    else:
+        evaluate(args)
+
+
+if __name__ == "__main__":
+    main()

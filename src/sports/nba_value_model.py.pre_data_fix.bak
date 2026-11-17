@@ -1,0 +1,531 @@
+"""Read-only NBA moneyline probability model and honest historical evaluation.
+
+No orders are placed. Historical price-based P&L requires timestamped, matched
+Kalshi executable asks; final scores alone cannot establish betting profitability.
+
+Commands:
+    python -m src.sports.nba_value_model fetch --start 2023-10-01 --end 2024-04-20
+    python -m src.sports.nba_value_model backtest --games data/sports/nba_games.csv --test-start 2025-10-01
+    python -m src.sports.nba_value_model predict --games data/sports/nba_games.csv --home BOS --away NYK --date 2026-10-25
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import requests
+from scipy.optimize import minimize
+from scipy.special import expit
+
+from src.kalshi.fees import calculate_taker_fee
+from src.sports.pricing.odds_math import remove_two_way_vig
+
+ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+GAME_FIELDS = ("game_id", "start_time", "date", "season", "home", "away", "home_score", "away_score")
+FEATURES = ("intercept", "elo_difference", "rest_difference", "form_difference", "win_rate_difference")
+DATA_DIR = Path("data/sports")
+
+
+def parse_time(value: str) -> datetime:
+    dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError(f"Timezone required for timestamp: {value}")
+    return dt.astimezone(timezone.utc)
+
+
+def parse_game(row: dict[str, str]) -> dict[str, Any]:
+    game = dict(row)
+    game["start_time"] = parse_time(row["start_time"])
+    game["date"] = date.fromisoformat(row["date"])
+    game["season"] = int(row["season"])
+    game["home_score"] = int(row["home_score"])
+    game["away_score"] = int(row["away_score"])
+    for side in ("home", "away"):
+        game[side] = row[side].strip().upper()
+    if not game["home"] or not game["away"] or game["home"] == game["away"]:
+        raise ValueError(f"Invalid teams for game {row.get('game_id')}")
+    if game["home_score"] == game["away_score"]:
+        raise ValueError("Completed NBA games cannot end in a tie")
+    return game
+
+
+def load_games(path: str | Path) -> list[dict[str, Any]]:
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    games = [parse_game(row) for row in rows]
+    keys = [game["game_id"] for game in games]
+    if len(set(keys)) != len(keys):
+        raise ValueError("Duplicate game_id in history")
+    return sorted(games, key=lambda game: (game["date"], game["start_time"], game["game_id"]))
+
+
+def save_games(games: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, GAME_FIELDS)
+        writer.writeheader()
+        for game in games:
+            writer.writerow({key: game[key] for key in GAME_FIELDS})
+
+
+def fetch_games(start: date, end: date, output: Path, cache: Path, delay: float = 0.3) -> None:
+    """ESPN's unofficial daily scoreboard: validated completed regular-season games only."""
+    if end < start:
+        raise ValueError("end must be after start")
+    cache.mkdir(parents=True, exist_ok=True)
+    existing = {g["game_id"]: {**g, "start_time": g["start_time"].isoformat(), "date": str(g["date"])}
+                for g in load_games(output)} if output.exists() else {}
+    session = requests.Session()
+    day = start
+    requests_made = 0
+    while day <= end:
+        if day.month in (5, 6, 7, 8, 9):  # Regular-season sample: October–April.
+            day += timedelta(days=1)
+            continue
+        cached = cache / f"{day:%Y%m%d}.json"
+        stable_day = day < datetime.now(timezone.utc).date() - timedelta(days=1)
+        if cached.exists() and stable_day:
+            payload = json.loads(cached.read_text(encoding="utf-8"))
+        else:
+            response = session.get(ESPN_URL, params={"dates": day.strftime("%Y%m%d"), "limit": 100},
+                                   timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload.get("events"), list):
+                raise ValueError(f"ESPN scoreboard response lacks events for {day}")
+            if stable_day:
+                cached.write_text(json.dumps(payload), encoding="utf-8")
+            requests_made += 1
+            if requests_made % 25 == 0:
+                print(f"Fetched {requests_made} scoreboard dates through {day}; caching results...", flush=True)
+            time.sleep(delay)
+        for event in payload.get("events", []):
+            season_data = event.get("season") or {}
+            if int(season_data.get("type") or 0) != 2:
+                continue  # Ignore preseason, playoffs, NBA Cup exhibition etc.
+            if not (event.get("status") or {}).get("type", {}).get("completed"):
+                continue
+            competitions = event.get("competitions") or []
+            if len(competitions) != 1:
+                continue
+            opponents = {c.get("homeAway"): c for c in competitions[0].get("competitors", [])}
+            if set(opponents) != {"home", "away"}:
+                continue
+            home, away = opponents["home"], opponents["away"]
+            if not home.get("score") or not away.get("score"):
+                continue
+            start_time = parse_time(event["date"])
+            try:
+                row = {
+                    "game_id": str(event["id"]),
+                    "start_time": start_time.isoformat(),
+                    "date": str(start_time.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date()),
+                    "season": int(season_data.get("year")),
+                    "home": home["team"]["abbreviation"].upper(),
+                    "away": away["team"]["abbreviation"].upper(),
+                    "home_score": int(home["score"]),
+                    "away_score": int(away["score"]),
+                }
+                parse_game(row)
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError(f"Invalid completed scoreboard game {event.get('id')}") from exc
+            existing[row["game_id"]] = row
+        day += timedelta(days=1)
+    save_games(sorted(existing.values(), key=lambda r: (r["date"], r["start_time"])), output)
+    print(f"Saved {len(existing)} completed regular-season NBA games to {output}; fetched {requests_made} dates")
+    print("Data source: ESPN unofficial scoreboard. Cached responses are never silently refreshed.")
+
+
+@dataclass
+class Team:
+    elo: float = 1500.0
+    last_played: date | None = None
+    margins: deque = field(default_factory=lambda: deque(maxlen=10))
+    wins: deque = field(default_factory=lambda: deque(maxlen=10))
+
+
+class PregameFeatures:
+    """Generate all matchup features BEFORE applying same-day results."""
+
+    def __init__(self) -> None:
+        self.teams: dict[str, Team] = defaultdict(Team)
+        self.season: int | None = None
+
+    def advance_season(self, season: int) -> None:
+        if self.season is None:
+            self.season = season
+        elif season != self.season:
+            if season < self.season:
+                raise ValueError("Games are not sorted in season order")
+            for team in self.teams.values():
+                team.elo = 1500.0 + 0.75 * (team.elo - 1500.0)
+                team.last_played = None
+                team.margins.clear()
+                team.wins.clear()
+            self.season = season
+
+    @staticmethod
+    def rest(team: Team, game_date: date) -> float:
+        if team.last_played is None:
+            return 3.0
+        return float(min(7, max(0, (game_date - team.last_played).days - 1)))
+
+    def features(self, home: str, away: str, day: date) -> tuple[np.ndarray, float]:
+        h, a = self.teams[home], self.teams[away]
+        rating = h.elo - a.elo + 70  # Home advantage, fixed pre-specified Elo points.
+        elo_probability = float(expit(math.log(10) * rating / 400))
+        rest_difference = self.rest(h, day) - self.rest(a, day)
+        hmargin = float(np.mean(h.margins)) if h.margins else 0.0
+        amargin = float(np.mean(a.margins)) if a.margins else 0.0
+        hrate = float(np.mean(h.wins)) if h.wins else 0.5
+        arate = float(np.mean(a.wins)) if a.wins else 0.5
+        x = np.array([1.0, rating / 400.0, rest_difference / 4.0,
+                      (hmargin - amargin) / 15.0, hrate - arate], dtype=float)
+        return x, elo_probability
+
+    def update(self, game: dict[str, Any]) -> None:
+        h, a = self.teams[game["home"]], self.teams[game["away"]]
+        diff = h.elo - a.elo + 70
+        p = float(expit(math.log(10) * diff / 400))
+        win = float(game["home_score"] > game["away_score"])
+        margin = game["home_score"] - game["away_score"]
+        change = 20 * (win - p)  # Elo uses outcome only; form uses the margin.
+        h.elo += change
+        a.elo -= change
+        h.margins.append(margin)
+        a.margins.append(-margin)
+        h.wins.append(win)
+        a.wins.append(1 - win)
+        h.last_played = a.last_played = game["date"]
+
+
+def make_rows(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    state = PregameFeatures()
+    rows = []
+    by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for game in games:
+        by_day[game["date"]].append(game)
+    for day in sorted(by_day):
+        games_today = by_day[day]
+        seasons = {g["season"] for g in games_today}
+        if len(seasons) != 1:
+            raise ValueError(f"Multiple season labels on {day}")
+        state.advance_season(next(iter(seasons)))
+        for game in games_today:
+            x, p = state.features(game["home"], game["away"], day)
+            rows.append({**game, "x": x, "elo_p": p,
+                         "y": int(game["home_score"] > game["away_score"])})
+        for game in games_today:
+            state.update(game)
+    return rows
+
+
+def fit_logistic(rows: list[dict[str, Any]]) -> np.ndarray:
+    if len(rows) < 200:
+        raise ValueError("At least 200 historical training games are required")
+    x = np.stack([r["x"] for r in rows])
+    y = np.array([r["y"] for r in rows], dtype=float)
+    if len(np.unique(y)) < 2:
+        raise ValueError("Training results must include both outcomes")
+
+    def objective(beta: np.ndarray) -> tuple[float, np.ndarray]:
+        z = x @ beta
+        loss = np.logaddexp(0.0, z).sum() - y @ z + 4.0 * np.dot(beta[1:], beta[1:])
+        grad = x.T @ (expit(z) - y)
+        grad[1:] += 8.0 * beta[1:]
+        return float(loss), grad
+
+    starting_beta = np.zeros(x.shape[1], dtype=float)
+    starting_beta[1] = 2.0
+    if x.shape[1] == 6:
+        starting_beta[-1] = 0.5
+    fitted = minimize(objective, starting_beta, jac=True, method="L-BFGS-B")
+    if not fitted.success:
+        raise RuntimeError(f"Model fitting failed: {fitted.message}")
+    return fitted.x
+
+
+def measures(probabilities: np.ndarray, targets: np.ndarray) -> dict[str, float]:
+    p = np.clip(probabilities, 1e-6, 1 - 1e-6)
+    accuracy = float(np.mean((p >= 0.5) == targets))
+    brier = float(np.mean((p - targets) ** 2))
+    logloss = float(-np.mean(targets * np.log(p) + (1 - targets) * np.log1p(-p)))
+    ece = 0.0
+    for low in np.arange(0, 1, 0.1):
+        selected = (p >= low) & (p < low + 0.1)
+        if selected.any():
+            ece += selected.mean() * abs(p[selected].mean() - targets[selected].mean())
+    return {"brier": brier, "logloss": logloss, "accuracy": accuracy, "ece": float(ece)}
+
+
+def split_and_fit(games: list[dict[str, Any]], test_start: date, test_end: date | None = None):
+    rows = make_rows(games)
+    training = [r for r in rows if r["date"] < test_start]
+    test = [r for r in rows if r["date"] >= test_start and (test_end is None or r["date"] <= test_end)]
+    if not test:
+        raise ValueError("No held-out games. Check --test-start and historical data coverage")
+    beta = fit_logistic(training)
+    for r in test:
+        r["model_p"] = float(expit(r["x"] @ beta))
+    return beta, training, test
+
+
+def eligible_quotes(rows: list[dict[str, Any]], quotes_file: str, cutoff_minutes: int
+                    ) -> dict[str, tuple[dict[str, str], float]]:
+    """One most-recent valid pregame snapshot per game, never post-tipoff."""
+    if cutoff_minutes < 1:
+        raise ValueError("cutoff_minutes must be positive")
+    by_game: dict[str, list[dict[str, str]]] = defaultdict(list)
+    with open(quotes_file, newline="", encoding="utf-8") as handle:
+        for quote in csv.DictReader(handle):
+            by_game[quote["game_id"]].append(quote)
+    selected = {}
+    for game in rows:
+        eligible = []
+        for q in by_game.get(game["game_id"], []):
+            try:
+                quote_time = parse_time(q["quote_time"])
+                age = (game["start_time"] - quote_time).total_seconds() / 60
+                if age < cutoff_minutes or age > 180:
+                    continue
+                if q.get("fee_type") not in {"quadratic", "quadratic_with_maker_fees"}:
+                    continue  # Unsupported/unknown fee schedule cannot be priced safely.
+                if q.get("fee_multiplier") in (None, ""):
+                    continue
+                multiplier = float(q["fee_multiplier"])
+                if not (0 <= multiplier <= 1):
+                    continue
+                eligible.append((quote_time, q, multiplier))
+            except (ValueError, TypeError, KeyError):
+                continue
+        if eligible:
+            _, q, multiplier = max(eligible, key=lambda item: item[0])
+            selected[game["game_id"]] = q, multiplier
+    return selected
+
+
+def book_probability(q: dict[str, str], max_age_seconds: int = 120) -> float | None:
+    """Use a true simultaneous and timely paired book quote, not postgame odds."""
+    try:
+        captured_at = parse_time(q["quote_time"])
+        updated_at = parse_time(q["book_quote_time"])
+        age = (captured_at - updated_at).total_seconds()
+        if not (0 <= age <= max_age_seconds):
+            return None
+        home, _ = remove_two_way_vig(float(q["book_home_american"]),
+                                     float(q["book_away_american"]))
+        return home if 0 < home < 1 else None
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def add_hybrid_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]],
+                           selected: dict[str, tuple[dict[str, str], float]]) -> bool:
+    for row in train + test:
+        entry = selected.get(row["game_id"])
+        row["book_p"] = book_probability(entry[0]) if entry is not None else None
+    with_book = [r for r in train if r["book_p"] is not None]
+    if len(with_book) < 200:
+        print(f"Hybrid model not trained: {len(with_book)} dated training sportsbook quotes; 200 required.")
+        return False
+    fit_rows = []
+    for row in with_book:
+        p = row["book_p"]
+        logodds = math.log(p / (1 - p))
+        fit_rows.append({**row, "x": np.append(row["x"], logodds)})
+    beta = fit_logistic(fit_rows)
+    for row in test:
+        if row["book_p"] is not None:
+            p = row["book_p"]
+            row["hybrid_p"] = float(expit(np.append(row["x"], math.log(p / (1 - p))) @ beta))
+    return True
+
+
+def save_predictions(test: list[dict[str, Any]]) -> None:
+    output = DATA_DIR / "nba_value_test_predictions.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fields = ("game_id", "date", "home", "away", "home_won", "elo_p", "model_p", "book_p", "hybrid_p")
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for game in test:
+            writer.writerow({"game_id": game["game_id"], "date": game["date"],
+                             "home": game["home"], "away": game["away"], "home_won": game["y"],
+                             "elo_p": game["elo_p"], "model_p": game["model_p"],
+                             "book_p": game.get("book_p"), "hybrid_p": game.get("hybrid_p")})
+    print(f"Saved held-out predictions to {output}")
+
+
+def summarize(test: list[dict[str, Any]]) -> None:
+    y = np.array([r["y"] for r in test], dtype=int)
+    for label, p in (("elo_baseline", np.array([r["elo_p"] for r in test])),
+                     ("statistical_model", np.array([r["model_p"] for r in test]))):
+        m = measures(p, y)
+        print(f"{label:20} Brier={m['brier']:.4f} LogLoss={m['logloss']:.4f} "
+              f"Accuracy={m['accuracy']:.1%} ECE={m['ece']:.4f}")
+    quoted = [r for r in test if r.get("book_p") is not None]
+    if quoted:
+        targets = np.array([r["y"] for r in quoted], dtype=int)
+        variants = [("sportsbook_baseline", np.array([r["book_p"] for r in quoted])),
+                    ("model_same_subset", np.array([r["model_p"] for r in quoted]))]
+        hybrid = [r for r in quoted if "hybrid_p" in r]
+        if len(hybrid) == len(quoted):
+            variants.append(("hybrid_same_subset", np.array([r["hybrid_p"] for r in quoted])))
+        print(f"Matched timestamped sportsbook quotes: {len(quoted)} held-out games")
+        for label, p in variants:
+            m = measures(p, targets)
+            print(f"{label:20} Brier={m['brier']:.4f} LogLoss={m['logloss']:.4f} "
+                  f"Accuracy={m['accuracy']:.1%} ECE={m['ece']:.4f}")
+    print("Predictive metrics alone are NOT betting P&L; profitable trading requires historical asks.")
+
+
+def evaluate_quotes(test: list[dict[str, Any]],
+                    selected: dict[str, tuple[dict[str, str], float]], qty: int,
+                    min_ev: float, min_roi: float, model: str) -> None:
+    if qty < 1 or min_roi < 0 or min_ev < 0:
+        raise ValueError("Invalid quantity or thresholds")
+    pnl, stake = 0.0, 0.0
+    trades = []
+    for game in test:
+        entry = selected.get(game["game_id"])
+        if entry is None:
+            continue
+        if model == "hybrid" and "hybrid_p" not in game:
+            continue
+        q, multiplier = entry
+        prob_home = game["model_p"] if model == "independent" else game["hybrid_p"]
+        candidates = []
+        for side, p_model, won in (("home", prob_home, game["y"]),
+                                   ("away", 1 - prob_home, 1 - game["y"])):
+            try:
+                price = float(q[f"{side}_yes_ask"])
+                depth = int(float(q[f"{side}_yes_depth"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not (0 < price < 1) or depth < qty:
+                continue
+            fee = calculate_taker_fee(price, qty, multiplier)
+            cost = price * qty + fee
+            expected = p_model * qty - cost
+            roi = expected / cost
+            if expected / qty >= min_ev and roi >= min_roi:
+                candidates.append((expected, side, price, cost, fee, won, roi, p_model))
+        if not candidates:
+            continue
+        expected, side, price, cost, fee, won, roi, p_model = max(candidates)
+        realized = qty * won - cost
+        pnl += realized
+        stake += cost
+        trades.append((game["game_id"], str(game["date"]), side, price,
+                       p_model, fee, expected, realized))
+    print(f"Historical Kalshi snapshots matched: {sum(r['game_id'] in selected for r in test)}/{len(test)}; "
+          f"{model} model trades: {len(trades)}")
+    if trades:
+        print(f"Simulated hold-to-settlement P&L=${pnl:+.2f}; cost=${stake:.2f}; ROI={pnl/stake:+.2%}")
+        print(f"Win rate={sum(t[-1] > 0 for t in trades)/len(trades):.1%}; ", end="")
+        print(f"expected total P&L=${sum(t[-2] for t in trades):+.2f}")
+    else:
+        print("No eligible trades (missing quote times, fee metadata, depth, or sufficient edge).")
+    output = DATA_DIR / "nba_value_backtest_trades.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["game_id", "date", "side", "ask", "model_probability", "fee", "expected_pnl", "realized_pnl"])
+        writer.writerows(trades)
+    print(f"Saved trades to {output} (research only; assumes fills at snapshot asks).")
+
+
+def predict(games: list[dict[str, Any]], home: str, away: str, when: date,
+            home_ask: float | None, away_ask: float | None, qty: int, fee_multiplier: float) -> None:
+    if home == away:
+        raise ValueError("Home and away teams must differ")
+    historical = [g for g in games if g["date"] < when]
+    if not historical:
+        raise ValueError("No historical games before requested date")
+    rows = make_rows(historical)
+    beta = fit_logistic(rows)
+    state = PregameFeatures()
+    # Updating all completed games in order, without using future outcomes.
+    for row in sorted(historical, key=lambda g: (g["date"], g["start_time"])):
+        state.advance_season(row["season"])
+        state.update(row)
+    new_season = when.year + 1 if when.month >= 10 else when.year
+    state.advance_season(new_season)
+    x, elo = state.features(home, away, when)
+    p_home = float(expit(x @ beta))
+    print(f"{away} @ {home} on {when} | NBA independent model")
+    print(f"Home={p_home:.2%} Away={1-p_home:.2%} | Elo home={elo:.2%}")
+    print("No injuries, confirmed lineups, or real-time data are included.")
+    for side, ask, p in (("HOME", home_ask, p_home), ("AWAY", away_ask, 1 - p_home)):
+        if ask is None:
+            continue
+        if not 0 < ask < 1 or qty < 1 or not 0 <= fee_multiplier <= 1:
+            raise ValueError("Invalid ask, quantity, or fee multiplier")
+        fee = calculate_taker_fee(ask, qty, fee_multiplier)
+        cost = qty * ask + fee
+        ev = qty * p - cost
+        print(f"{side} YES ask={ask:.3f} fee=${fee:.2f} expected_pnl=${ev:+.2f} expected_ROI={ev/cost:+.2%}")
+    print("Prices are user-supplied, not live verified. NO ORDERS PLACED.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Read-only NBA moneyline model")
+    sub = parser.add_subparsers(dest="command", required=True)
+    fetch = sub.add_parser("fetch")
+    fetch.add_argument("--start", type=date.fromisoformat, required=True)
+    fetch.add_argument("--end", type=date.fromisoformat, required=True)
+    fetch.add_argument("--games", type=Path, default=DATA_DIR / "nba_games.csv")
+    fetch.add_argument("--cache", type=Path, default=DATA_DIR / "espn_cache")
+    bt = sub.add_parser("backtest")
+    bt.add_argument("--games", type=Path, default=DATA_DIR / "nba_games.csv")
+    bt.add_argument("--test-start", type=date.fromisoformat, required=True)
+    bt.add_argument("--test-end", type=date.fromisoformat)
+    bt.add_argument("--quotes", type=Path, help="Timestamped matched Kalshi asks CSV; optional")
+    bt.add_argument("--qty", type=int, default=10)
+    bt.add_argument("--min-ev", type=float, default=0.03, help="Minimum net model EV per contract")
+    bt.add_argument("--min-roi", type=float, default=0.05)
+    bt.add_argument("--cutoff-minutes", type=int, default=10)
+    bt.add_argument("--model", choices=("independent", "hybrid"), default="independent")
+    pred = sub.add_parser("predict")
+    pred.add_argument("--games", type=Path, default=DATA_DIR / "nba_games.csv")
+    pred.add_argument("--home", required=True)
+    pred.add_argument("--away", required=True)
+    pred.add_argument("--date", type=date.fromisoformat, required=True)
+    pred.add_argument("--home-ask", type=float)
+    pred.add_argument("--away-ask", type=float)
+    pred.add_argument("--qty", type=int, default=10)
+    pred.add_argument("--fee-multiplier", type=float, default=1.0)
+    args = parser.parse_args()
+    if args.command == "fetch":
+        fetch_games(args.start, args.end, args.games, args.cache)
+    elif args.command == "backtest":
+        _, train, test = split_and_fit(load_games(args.games), args.test_start, args.test_end)
+        print(f"Training games={len(train)}; held-out games={len(test)}; scoring {test[0]['date']}–{test[-1]['date']}")
+        if args.quotes:
+            selected = eligible_quotes(train + test, str(args.quotes), args.cutoff_minutes)
+            have_hybrid = add_hybrid_predictions(train, test, selected)
+            summarize(test)
+            save_predictions(test)
+            if args.model == "hybrid" and not have_hybrid:
+                raise ValueError("Hybrid model needs >=200 timestamped historical sportsbook odds in training window")
+            evaluate_quotes(test, selected, args.qty, args.min_ev, args.min_roi, args.model)
+        else:
+            summarize(test)
+            save_predictions(test)
+            print("No historical Kalshi asks provided; ROI deliberately not calculated.")
+    else:
+        predict(load_games(args.games), args.home.upper(), args.away.upper(),
+                args.date, args.home_ask, args.away_ask, args.qty, args.fee_multiplier)
+
+
+if __name__ == "__main__":
+    main()

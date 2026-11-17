@@ -10,7 +10,8 @@ Historical publication availability is approximated with a lag.
 from pathlib import Path
 import io
 import time
-
+import argparse
+from joblib import dump
 import numpy as np
 import pandas as pd
 import requests
@@ -33,7 +34,6 @@ STATIONS = {
 
 # Conservative, ASSUMED delay after measurement.
 # Historical first-publication times are unavailable.
-LAG_MIN = 20
 MAX_AGE_MIN = 120
 
 
@@ -149,7 +149,7 @@ def get_airport(station, network):
     return data
 
 
-def normalize(raw, station):
+def normalize(raw, station, lag_minutes):
     df = raw.copy()
 
     df["observed"] = pd.to_datetime(
@@ -199,7 +199,7 @@ def normalize(raw, station):
     # assumed publication delay has elapsed.
     df["available"] = (
         df["observed"]
-        + pd.Timedelta(minutes=LAG_MIN)
+        + pd.Timedelta(minutes=lag_minutes)
     )
 
     df["prior_temp"] = df["temp"].shift(1)
@@ -237,7 +237,7 @@ def features_at_decision(grid, station, obs):
         right_on="available",
         direction="backward",
         tolerance=pd.Timedelta(
-            minutes=MAX_AGE_MIN + LAG_MIN
+            minutes=MAX_AGE_MIN + 60
         ),
     )
 
@@ -318,14 +318,42 @@ def score(actual, predicted):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--knyc-lag",
+        type=int,
+        default=5,
+        help="Assumed KNYC report delay in minutes",
+    )
+
+    parser.add_argument(
+        "--airport-lag",
+        type=int,
+        default=6,
+        help="Assumed nearby-airport delay in minutes",
+    )
+
+    args = parser.parse_args()
+
+    if args.knyc_lag < 0 or args.airport_lag < 0:
+        parser.error("Reporting delays cannot be negative")
+
     OUT.mkdir(parents=True, exist_ok=True)
+
+    run_dir = OUT / (
+        f"lag_nyc{args.knyc_lag}_"
+        f"airports{args.airport_lag}"
+    )
+
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     # KNYC official observations, NOT 1-minute archive.
     raw = pd.read_csv(
         BASE / "knyc_high_frequency_observations.csv"
     )
 
-    knyc = normalize(raw, "NYC")
+    knyc = normalize(raw, "NYC", args.knyc_lag)
 
     labels = raw.copy()
 
@@ -450,6 +478,7 @@ def main():
             else normalize(
                 get_airport(station, network),
                 station,
+                args.airport_lag,
             )
         )
 
@@ -627,19 +656,32 @@ def main():
     comparison = pd.DataFrame(results)
 
     test.to_csv(
-        OUT / "october_predictions_live_feasible.csv",
+        run_dir / "october_predictions_live_feasible.csv",
         index=False,
     )
 
     comparison.to_csv(
-        OUT / "october_horizon_comparison.csv",
+        run_dir / "october_horizon_comparison.csv",
         index=False,
+    )
+
+    dump(
+        {
+            "model": model,
+            "features": features,
+            "knyc_lag_minutes": args.knyc_lag,
+            "airport_lag_minutes": args.airport_lag,
+            "validation_mae": validation_mae,
+            "selected_tree_leaves": leaves,
+        },
+        run_dir / "model.joblib",
     )
 
     print("\n=== LIVE-FEASIBLE RETEST ===")
     print(
-        "Assumed availability lag:",
-        LAG_MIN, "minutes",
+        "Assumed availability delays:",
+        f"KNYC={args.knyc_lag}m, "
+        f"airports={args.airport_lag}m",
     )
     print("Stations: KNYC, KLGA, KEWR, KTEB")
     print("Horizons:", HORIZONS)
@@ -656,7 +698,7 @@ def main():
     print("\n=== OCTOBER PERFORMANCE ===")
     print(comparison.to_string(index=False))
 
-    print("\nSaved to:", OUT.resolve())
+    print("\nSaved to:", run_dir.resolve())
     print(
         "\nCAUTION: Historical report arrival times "
         "are unknown. This is a lag-assumed backtest."

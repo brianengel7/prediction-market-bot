@@ -1,0 +1,28 @@
+{
+  "source": "binance_global_usdt_public_benchmark_RESEARCH_ONLY",
+  "costs": {
+    "spot_fee_bps": 10,
+    "perp_fee_bps": 5,
+    "spot_slippage_bps": 2,
+    "perp_slippage_bps": 2,
+    "spot_finance_annual_pct": 0,
+    "perp_initial_margin_fraction": 0.2,
+    "perp_extra_margin_fraction": 0.1,
+    "maintenance_margin_fraction": 0.05
+  },
+  "symbol_set": [
+    "BTCUSDT"
+  ],
+  "train_fraction": 0.7,
+  "train_min_trades": 10,
+  "spot_notional": 1000,
+  "method": "Close t-1 signal -> next open entry -> hold hours -> open exit. Funding actual historical cash events strictly inside hold period; training signal uses only funding strictly before entry. Single asset position at once. No funding forecasting, depth or executable quotes.",
+  "WARNINGS": [
+    "U.S. venue not represented; Binance Global research benchmark only",
+    "Margin stress is NOT a liquidation simulator",
+    "Funding at entry/exit instant excluded",
+    "No cross-asset portfolio-level ROI / correlated collateral modeling",
+    "Model search lower95 is heuristic and ignores multiple-testing bias",
+    "Historical funding is known for P&L only; trailing funding is signal, not forward rates"
+  ]
+}

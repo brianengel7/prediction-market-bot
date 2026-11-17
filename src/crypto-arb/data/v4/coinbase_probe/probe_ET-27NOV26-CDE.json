@@ -1,0 +1,204 @@
+{
+  "status": "LIVE_PUBLIC_BOOK_DIAGNOSTIC_NOT_EXECUTABLE_ARB",
+  "fetched_between_utc": [
+    "2026-11-13T14:32:28.749694+00:00",
+    "2026-11-13T14:32:28.935885+00:00"
+  ],
+  "future_metadata": {
+    "product_id": "ET-27NOV26-CDE",
+    "product_type": "FUTURE",
+    "product_venue": "FCM",
+    "display_name": "ETH 27-Nov",
+    "contract_code": "ET",
+    "contract_size": "0.1",
+    "contract_root_unit": "ETH",
+    "contract_expiry_utc": "2026-11-27T16:00:00+00:00",
+    "contract_expiry_type": "EXPIRING",
+    "future_venue": "cde",
+    "status": ""
+  },
+  "spot_book": {
+    "product_id": "ETH-USD",
+    "book_time_utc": "2026-11-13T14:32:27.713942+00:00",
+    "bids": [
+      {
+        "price": 1969.21,
+        "size_as_returned": 1.753
+      },
+      {
+        "price": 1969.13,
+        "size_as_returned": 0.25384705
+      },
+      {
+        "price": 1969.12,
+        "size_as_returned": 1.52550818
+      },
+      {
+        "price": 1969.11,
+        "size_as_returned": 2.55529009
+      },
+      {
+        "price": 1969.04,
+        "size_as_returned": 1.70115253
+      },
+      {
+        "price": 1969.03,
+        "size_as_returned": 2.02536261
+      },
+      {
+        "price": 1969.01,
+        "size_as_returned": 0.82413911
+      },
+      {
+        "price": 1968.93,
+        "size_as_returned": 0.00076157
+      },
+      {
+        "price": 1968.9,
+        "size_as_returned": 10.38962166
+      },
+      {
+        "price": 1968.84,
+        "size_as_returned": 2.02636261
+      }
+    ],
+    "asks": [
+      {
+        "price": 1969.31,
+        "size_as_returned": 4.57014482
+      },
+      {
+        "price": 1969.46,
+        "size_as_returned": 1.20914148
+      },
+      {
+        "price": 1969.47,
+        "size_as_returned": 2.02536261
+      },
+      {
+        "price": 1969.51,
+        "size_as_returned": 1.68315008
+      },
+      {
+        "price": 1969.53,
+        "size_as_returned": 0.79398425
+      },
+      {
+        "price": 1969.55,
+        "size_as_returned": 2.02536261
+      },
+      {
+        "price": 1969.61,
+        "size_as_returned": 12.54623927
+      },
+      {
+        "price": 1969.62,
+        "size_as_returned": 10.66196939
+      },
+      {
+        "price": 1969.63,
+        "size_as_returned": 2.02536261
+      },
+      {
+        "price": 1969.65,
+        "size_as_returned": 4.67979
+      }
+    ]
+  },
+  "future_book": {
+    "product_id": "ET-27NOV26-CDE",
+    "book_time_utc": "2026-11-13T14:32:28.568603+00:00",
+    "bids": [
+      {
+        "price": 1972.0,
+        "size_as_returned": 359.0
+      },
+      {
+        "price": 1971.5,
+        "size_as_returned": 500.0
+      },
+      {
+        "price": 1971.0,
+        "size_as_returned": 726.0
+      },
+      {
+        "price": 1970.5,
+        "size_as_returned": 916.0
+      },
+      {
+        "price": 1970.0,
+        "size_as_returned": 1118.0
+      },
+      {
+        "price": 1969.5,
+        "size_as_returned": 1287.0
+      },
+      {
+        "price": 1969.0,
+        "size_as_returned": 845.0
+      },
+      {
+        "price": 1968.5,
+        "size_as_returned": 779.0
+      },
+      {
+        "price": 1968.0,
+        "size_as_returned": 884.0
+      },
+      {
+        "price": 1967.5,
+        "size_as_returned": 810.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 1973.0,
+        "size_as_returned": 261.0
+      },
+      {
+        "price": 1973.5,
+        "size_as_returned": 986.0
+      },
+      {
+        "price": 1974.0,
+        "size_as_returned": 768.0
+      },
+      {
+        "price": 1974.5,
+        "size_as_returned": 888.0
+      },
+      {
+        "price": 1975.0,
+        "size_as_returned": 782.0
+      },
+      {
+        "price": 1975.5,
+        "size_as_returned": 1106.0
+      },
+      {
+        "price": 1976.0,
+        "size_as_returned": 917.0
+      },
+      {
+        "price": 1976.5,
+        "size_as_returned": 759.0
+      },
+      {
+        "price": 1977.0,
+        "size_as_returned": 901.0
+      },
+      {
+        "price": 1977.5,
+        "size_as_returned": 769.0
+      }
+    ]
+  },
+  "book_timestamp_skew_s": 0.854661,
+  "limitations": [
+    "Book levels not tested for reachable exchange depth or trades",
+    "Futures book level size unit is UNVERIFIED (do not assume contracts)",
+    "Contract root unit/size and final settlement methodology require confirmation",
+    "Spot and futures bids/asks were fetched sequentially, not atomically",
+    "Do not feed to V4 scan until validated"
+  ]
+}

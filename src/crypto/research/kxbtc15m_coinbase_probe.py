@@ -17,7 +17,7 @@ from pathlib import Path
 
 import websockets
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ed25519
 from dotenv import load_dotenv
 
 K_WS = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
@@ -90,14 +90,21 @@ def credentials():
 def auth_headers(key_id, key):
     timestamp = str(int(ms()))
     message = (timestamp + "GET" + K_PATH).encode()
-    signature = key.sign(
-        message,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH
-        ),
-        hashes.SHA256()
-    )
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        signature = key.sign(message)
+    elif isinstance(key, rsa.RSAPrivateKey):
+        signature = key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH
+            ),
+            hashes.SHA256()
+        )
+    else:
+        raise TypeError(
+            f"Unsupported key type: {type(key).__name__}"
+        )
     return {
         "KALSHI-ACCESS-KEY": key_id,
         "KALSHI-ACCESS-SIGNATURE":

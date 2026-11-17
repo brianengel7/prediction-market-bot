@@ -1,0 +1,204 @@
+{
+  "status": "LIVE_PUBLIC_BOOK_DIAGNOSTIC_NOT_EXECUTABLE_ARB",
+  "fetched_between_utc": [
+    "2026-11-13T14:32:28.433549+00:00",
+    "2026-11-13T14:32:28.654328+00:00"
+  ],
+  "future_metadata": {
+    "product_id": "BIT-24DEC26-CDE",
+    "product_type": "FUTURE",
+    "product_venue": "FCM",
+    "display_name": "BTC 24-Dec",
+    "contract_code": "BIT",
+    "contract_size": "0.01",
+    "contract_root_unit": "BTC",
+    "contract_expiry_utc": "2026-12-24T16:00:00+00:00",
+    "contract_expiry_type": "EXPIRING",
+    "future_venue": "cde",
+    "status": ""
+  },
+  "spot_book": {
+    "product_id": "BTC-USD",
+    "book_time_utc": "2026-11-13T14:32:28.214140+00:00",
+    "bids": [
+      {
+        "price": 69388.5,
+        "size_as_returned": 0.21452625
+      },
+      {
+        "price": 69388.02,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69387.61,
+        "size_as_returned": 0.00720531
+      },
+      {
+        "price": 69387.45,
+        "size_as_returned": 0.28821251
+      },
+      {
+        "price": 69387.43,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69387.08,
+        "size_as_returned": 0.28836043
+      },
+      {
+        "price": 69386.73,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69386.25,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69385.76,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69385.11,
+        "size_as_returned": 0.00014792
+      }
+    ],
+    "asks": [
+      {
+        "price": 69388.51,
+        "size_as_returned": 0.095048
+      },
+      {
+        "price": 69388.85,
+        "size_as_returned": 0.009026
+      },
+      {
+        "price": 69388.86,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69389.09,
+        "size_as_returned": 0.0013492
+      },
+      {
+        "price": 69389.19,
+        "size_as_returned": 0.01
+      },
+      {
+        "price": 69389.2,
+        "size_as_returned": 0.41335186
+      },
+      {
+        "price": 69389.21,
+        "size_as_returned": 0.69193792
+      },
+      {
+        "price": 69389.56,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69389.91,
+        "size_as_returned": 0.00014792
+      },
+      {
+        "price": 69390.25,
+        "size_as_returned": 0.00576464
+      }
+    ]
+  },
+  "future_book": {
+    "product_id": "BIT-24DEC26-CDE",
+    "book_time_utc": "2026-11-13T14:32:27.609047+00:00",
+    "bids": [
+      {
+        "price": 69755.0,
+        "size_as_returned": 50.0
+      },
+      {
+        "price": 69750.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 69725.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 69675.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69660.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69650.0,
+        "size_as_returned": 1.0
+      },
+      {
+        "price": 69645.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69630.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69375.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 69300.0,
+        "size_as_returned": 25.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 69845.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 69850.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 69910.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 69930.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69940.0,
+        "size_as_returned": 1.0
+      },
+      {
+        "price": 69945.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69960.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 69975.0,
+        "size_as_returned": 125.0
+      },
+      {
+        "price": 70275.0,
+        "size_as_returned": 25.0
+      },
+      {
+        "price": 70350.0,
+        "size_as_returned": 25.0
+      }
+    ]
+  },
+  "book_timestamp_skew_s": 0.605093,
+  "limitations": [
+    "Book levels not tested for reachable exchange depth or trades",
+    "Futures book level size unit is UNVERIFIED (do not assume contracts)",
+    "Contract root unit/size and final settlement methodology require confirmation",
+    "Spot and futures bids/asks were fetched sequentially, not atomically",
+    "Do not feed to V4 scan until validated"
+  ]
+}

@@ -1,0 +1,204 @@
+{
+  "status": "LIVE_PUBLIC_BOOK_DIAGNOSTIC_NOT_EXECUTABLE_ARB",
+  "fetched_between_utc": [
+    "2026-11-13T14:32:29.577503+00:00",
+    "2026-11-13T14:32:29.775393+00:00"
+  ],
+  "future_metadata": {
+    "product_id": "SOL-24DEC26-CDE",
+    "product_type": "FUTURE",
+    "product_venue": "FCM",
+    "display_name": "SOL 24-Dec",
+    "contract_code": "SOL",
+    "contract_size": "5",
+    "contract_root_unit": "SOL",
+    "contract_expiry_utc": "2026-12-24T16:00:00+00:00",
+    "contract_expiry_type": "EXPIRING",
+    "future_venue": "cde",
+    "status": ""
+  },
+  "spot_book": {
+    "product_id": "SOL-USD",
+    "book_time_utc": "2026-11-13T14:32:29.360449+00:00",
+    "bids": [
+      {
+        "price": 81.63,
+        "size_as_returned": 65.7653441
+      },
+      {
+        "price": 81.62,
+        "size_as_returned": 24.58093364
+      },
+      {
+        "price": 81.61,
+        "size_as_returned": 232.65700472
+      },
+      {
+        "price": 81.6,
+        "size_as_returned": 811.57757921
+      },
+      {
+        "price": 81.59,
+        "size_as_returned": 952.49706948
+      },
+      {
+        "price": 81.58,
+        "size_as_returned": 1019.5689135
+      },
+      {
+        "price": 81.57,
+        "size_as_returned": 424.87961048
+      },
+      {
+        "price": 81.56,
+        "size_as_returned": 323.06706019
+      },
+      {
+        "price": 81.55,
+        "size_as_returned": 1230.85156697
+      },
+      {
+        "price": 81.54,
+        "size_as_returned": 2524.51372423
+      }
+    ],
+    "asks": [
+      {
+        "price": 81.64,
+        "size_as_returned": 3.704e-05
+      },
+      {
+        "price": 81.65,
+        "size_as_returned": 71.47045315
+      },
+      {
+        "price": 81.66,
+        "size_as_returned": 87.10149598
+      },
+      {
+        "price": 81.67,
+        "size_as_returned": 493.22743088
+      },
+      {
+        "price": 81.68,
+        "size_as_returned": 248.60523167
+      },
+      {
+        "price": 81.69,
+        "size_as_returned": 500.66104734
+      },
+      {
+        "price": 81.7,
+        "size_as_returned": 541.22837558
+      },
+      {
+        "price": 81.71,
+        "size_as_returned": 193.8898835
+      },
+      {
+        "price": 81.72,
+        "size_as_returned": 1605.11031156
+      },
+      {
+        "price": 81.73,
+        "size_as_returned": 320.64982841
+      }
+    ]
+  },
+  "future_book": {
+    "product_id": "SOL-24DEC26-CDE",
+    "book_time_utc": "2026-11-13T14:32:29.462844+00:00",
+    "bids": [
+      {
+        "price": 81.93,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.85,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.83,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.82,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.81,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.8,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.79,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.78,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 81.76,
+        "size_as_returned": 155.0
+      },
+      {
+        "price": 81.74,
+        "size_as_returned": 75.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 82.07,
+        "size_as_returned": 55.0
+      },
+      {
+        "price": 82.08,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 82.14,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 82.15,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 82.16,
+        "size_as_returned": 90.0
+      },
+      {
+        "price": 82.17,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 82.18,
+        "size_as_returned": 90.0
+      },
+      {
+        "price": 82.19,
+        "size_as_returned": 15.0
+      },
+      {
+        "price": 82.2,
+        "size_as_returned": 105.0
+      },
+      {
+        "price": 82.21,
+        "size_as_returned": 515.0
+      }
+    ]
+  },
+  "book_timestamp_skew_s": 0.102395,
+  "limitations": [
+    "Book levels not tested for reachable exchange depth or trades",
+    "Futures book level size unit is UNVERIFIED (do not assume contracts)",
+    "Contract root unit/size and final settlement methodology require confirmation",
+    "Spot and futures bids/asks were fetched sequentially, not atomically",
+    "Do not feed to V4 scan until validated"
+  ]
+}

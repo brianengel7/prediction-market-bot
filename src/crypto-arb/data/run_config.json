@@ -1,0 +1,19 @@
+{
+  "out_dir": "src/crypto-arb/data",
+  "symbols": "BTC-USD,ETH-USD,SOL-USD,LINK-USD,AVAX-USD,ADA-USD,XRP-USD,DOGE-USD,LTC-USD,AAVE-USD",
+  "granularity": 3600,
+  "train_fraction": 0.7,
+  "min_bars": 650,
+  "min_coverage": 0.97,
+  "min_corr": 0.6,
+  "max_q": 0.1,
+  "min_half_life_hours": 2,
+  "max_half_life_hours": 240,
+  "entry_z": 2.0,
+  "exit_z": 0.5,
+  "stop_z": 4.0,
+  "max_hold_bars": 168,
+  "fee_bps": 40.0,
+  "slippage_bps": 5.0,
+  "carry_bps_day": 0.0
+}

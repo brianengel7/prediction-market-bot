@@ -1,0 +1,38 @@
+{
+  "source": "binance_global_usdt_public_benchmark_RESEARCH_ONLY",
+  "timeframe": "1h",
+  "interval_ms": 3600000,
+  "archive_source": "official Binance Vision monthly ZIP files; SHA256 verified",
+  "funding_mark_method": "latest COMPLETED 1h MARK candle close within 1h of each event; NOT exact settlement mark",
+  "mark_gap_policy": "report missing mark candle hours; reject any stale funding mark, never impute",
+  "mark_gap_counts": {
+    "ETHUSDT": 24,
+    "SOLUSDT": 24
+  },
+  "mark_daily_recovered_hours": {
+    "ETHUSDT": 24,
+    "SOLUSDT": 24
+  },
+  "mark_daily_recovery_errors": {
+    "ETHUSDT": [],
+    "SOLUSDT": []
+  },
+  "funding_time_policy": "ISO8601 mixed precision; <=10-second post-hour stamps accounted at UTC hour (original preserved)",
+  "initial_funding_events_excluded": {
+    "ETHUSDT": 1,
+    "SOLUSDT": 1
+  },
+  "months": [
+    "2026-05",
+    "2026-06",
+    "2026-07",
+    "2026-08",
+    "2026-09",
+    "2026-10"
+  ],
+  "symbols": [
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "notice": "RESEARCH ONLY. U.S. non-executable benchmark; no authenticated API calls."
+}

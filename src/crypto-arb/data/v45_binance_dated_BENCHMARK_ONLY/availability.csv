@@ -1,0 +1,10 @@
+asset,expiry_date,symbol,status,notes
+ETH,2024-09-27,ETHUSDT_240927,ARCHIVE_VERIFIED,633 future candles; 720 spot candles
+ETH,2024-12-27,ETHUSDT_241227,ARCHIVE_VERIFIED,633 future candles; 744 spot candles
+ETH,2025-03-28,ETHUSDT_250328,ARCHIVE_VERIFIED,657 future candles; 744 spot candles
+ETH,2025-06-27,ETHUSDT_250627,ARCHIVE_VERIFIED,633 future candles; 720 spot candles
+ETH,2025-09-26,ETHUSDT_250926,ARCHIVE_VERIFIED,609 future candles; 720 spot candles
+ETH,2025-12-26,ETHUSDT_251226,ARCHIVE_VERIFIED,744 future candles; 744 spot candles
+ETH,2026-03-27,ETHUSDT_260327,ARCHIVE_VERIFIED,744 future candles; 744 spot candles
+ETH,2026-06-26,ETHUSDT_260626,ARCHIVE_VERIFIED,609 future candles; 720 spot candles
+ETH,2026-09-25,ETHUSDT_260925,ARCHIVE_VERIFIED,585 future candles; 720 spot candles
