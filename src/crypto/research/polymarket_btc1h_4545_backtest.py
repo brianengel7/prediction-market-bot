@@ -36,6 +36,14 @@ import zipfile
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+# Load project-root .env for Windows/Linux when running scripts directly.
+# An already configured process environment takes priority.
+try:
+    from dotenv import load_dotenv
+except ImportError as exc:
+    raise RuntimeError("Install .env loader: python -m pip install python-dotenv") from exc
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo('America/New_York')
@@ -151,16 +159,28 @@ def download_one(session, key, day, typ, outcome, root, offline=False):
 
 
 class ZipReader:
-    def __init__(self):
+    def __init__(self, cloud=None):
         self.zip_cache = {}
+        self.cloud = cloud
+        self.handles = {}
+
+    def close(self):
+        for z in self.handles.values():
+            z.close()
+        self.handles.clear()
 
     def read(self, zip_path, slug):
         import pandas as pd
-        if not zip_path.exists():
-            return None
+        if self.cloud:
+            if zip_path not in self.handles:
+                self.handles[zip_path] = self.cloud.open_zip(zip_path)
+            z = self.handles[zip_path]
+        else:
+            if not zip_path.exists():
+                return None
+            z = zipfile.ZipFile(zip_path)
         if zip_path not in self.zip_cache:
-            with zipfile.ZipFile(zip_path) as z:
-                names = [n for n in z.namelist() if n.lower().endswith('.parquet') and not n.startswith('__MACOSX')]
+            names = [n for n in z.namelist() if n.lower().endswith('.parquet') and not n.startswith('__MACOSX')]
             mapping = {}
             for n in names:
                 stem = Path(n).stem
@@ -174,17 +194,23 @@ class ZipReader:
             # Different bundle naming? Only scan a file as fallback if names have no slug.
             if not mapping and names:
                 raise RuntimeError(f'Unknown ZIP filename format in {zip_path}: {names[:3]}')
+            if not self.cloud:
+                z.close()
             return None
-        with zipfile.ZipFile(zip_path) as z:
+        try:
             buf = io.BytesIO(z.read(member))
-        return pd.read_parquet(buf)
+            return pd.read_parquet(buf)
+        finally:
+            if not self.cloud:
+                z.close()
 
 
-def concatenate_market(reader, root, slug, typ, outcome, dates):
+def concatenate_market(reader, root, slug, typ, outcome, dates, cloud=None):
     import pandas as pd
     parts = []
     for d in dates:
-        part = reader.read(filename_for(root,d,typ,outcome),slug)
+        name=filename_for(root,d,typ,outcome)
+        part = reader.read(cloud.object_key('btc-1h',name.name) if cloud else name,slug)
         if part is not None and len(part):
             if 'market_slug' in part.columns:
                 part = part[part.market_slug.astype(str) == slug]
@@ -390,16 +416,31 @@ def command(args):
     if not key and not args.offline:
         raise SystemExit('PMDATA_API_KEY is missing. Set env variable or use --pmdata-key (not recommended for shell history).')
     out=Path(args.output_dir)
+    out.mkdir(parents=True,exist_ok=True)
     cache=out/'cache'
-    cache.mkdir(parents=True,exist_ok=True)
+    cloud=None
+    if args.storage=='supabase':
+        from pmdata_supabase_storage import SupabaseArchive, migrate_cache
+        cloud=SupabaseArchive()
+        if args.migrate_cache:
+            migrate_cache(cloud,'btc-1h',cache)
+    else:
+        cache.mkdir(parents=True,exist_ok=True)
     # Day -1 warms up the book for midnight markets; +1 catches the last hour
     # and delayed resolution events. These are cached on disk and reused.
     download_days=list(dates_between(start-timedelta(days=1),end+timedelta(days=1)))
     sess=requests.Session()
     for day in download_days:
         for kind,outcome in (('l2','Yes'),('l2','No'),('trades','All')):
-            download_one(sess,key,day,kind,outcome,cache,args.offline)
-    reader=ZipReader()
+            if cloud:
+                filename=filename_for(cache,day,kind,outcome).name
+                url=f'{BASE}/{kind}/{day:%Y/%m/%d}/btc-1h.zip'
+                if kind=='l2' and outcome=='No':
+                    url += '?outcome=No'
+                cloud.transfer_pmdata(sess,key,url,'btc-1h',filename,offline=args.offline)
+            else:
+                download_one(sess,key,day,kind,outcome,cache,args.offline)
+    reader=ZipReader(cloud=cloud)
     price=round(args.price,4)
     latency=args.latency_ms/1000
     horizons=[15,30,45,60]
@@ -413,9 +454,9 @@ def command(args):
             # Reading previous UTC partition allows reconstructing the as-of
             # book when this market started trading before the selected hour.
             inspect_days=[day-timedelta(days=1),day,day+timedelta(days=1)]
-            yes=concatenate_market(reader,cache,slug,'l2','Yes',inspect_days)
-            no=concatenate_market(reader,cache,slug,'l2','No',inspect_days)
-            trades=concatenate_market(reader,cache,slug,'trades','All',inspect_days)
+            yes=concatenate_market(reader,cache,slug,'l2','Yes',inspect_days,cloud)
+            no=concatenate_market(reader,cache,slug,'l2','No',inspect_days,cloud)
+            trades=concatenate_market(reader,cache,slug,'trades','All',inspect_days,cloud)
             if yes is None or no is None:
                 print(f'  MISSING L2 {slug} yes={yes is not None} no={no is not None}',flush=True)
                 rows.append(dict(slug=slug,t0=t0.timestamp(),missing=True))
@@ -445,6 +486,7 @@ def command(args):
                     for col in ('sell_print_ts','trade_through_ts','queue_proxy_ts','sell_volume_at_bid'):
                         row[f'{name}_{col}']=arrive if (book.get('marketable_full') and col.endswith('_ts')) else None
             rows.append(row)
+    reader.close()
     valid=[r for r in rows if not r['missing']]
     summary=summarize(valid,price,args.size,horizons)
     summary['metadata']=dict(start=args.start,end=args.end,price=price,size=args.size,
@@ -464,6 +506,10 @@ def command(args):
         writer.writeheader();writer.writerows(rows)
     with (out/'summary.json').open('w') as f:
         json.dump(summary,f,indent=2,allow_nan=False)
+    if cloud:
+        tag=f'{args.start}_{args.end}_p{round(price*100):02d}'
+        cloud.put_result(out/'summary.json',f'research/polymarket/btc-1h/{tag}_summary.json')
+        cloud.put_result(out/'per_market.csv',f'research/polymarket/btc-1h/{tag}_per_market.csv')
     print('\nBTC 1-HOUR 45/45, HISTORICAL, READ-ONLY')
     print(json.dumps(summary['metadata'],indent=2))
     for uni in ('both_resting','all_valid_books'):
@@ -476,7 +522,7 @@ def command(args):
                       f"both%={row['both_pct']} | settled={row['resolved']} | gross P&L={row['gross_pnl']:+.2f}")
     print('\nCAVEAT: ALL_VALID_BOOKS includes immediate marketable orders (taker, assumed full depth).')
     print('BOTH_RESTING is maker-only. Print/queue signals are not confirmed fills.')
-    print('Gross P&L assumes 45c fill, excludes fees, rebates, partial orders, latency drift.')
+    print(f'Gross P&L assumes {price*100:g}c fill, excludes fees, rebates, partial orders, latency drift.')
     print('\nFiles:',out/'summary.json','and',out/'per_market.csv')
 
 
@@ -540,6 +586,10 @@ def main():
     p.add_argument('--output-dir',default='data/research/poly_btc1h_4545')
     p.add_argument('--pmdata-key',default=None,help='Prefer PMDATA_API_KEY env variable')
     p.add_argument('--offline',action='store_true',help='Use already cached ZIPs')
+    p.add_argument('--storage',choices=('supabase','local'),default='supabase',
+                   help='Supabase Storage (default) streams archives without Codespace disk cache')
+    p.add_argument('--migrate-cache',action='store_true',
+                   help='Upload existing local cache ZIPs to Supabase before replay; never delete files')
     p.add_argument('--self-test',action='store_true')
     args=p.parse_args()
     if args.self_test:self_test()

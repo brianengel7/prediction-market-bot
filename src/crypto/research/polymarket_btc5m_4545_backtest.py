@@ -35,6 +35,14 @@ import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+# Load project-root .env for Windows/Linux when running scripts directly.
+# An already configured process environment takes priority.
+try:
+    from dotenv import load_dotenv
+except ImportError as exc:
+    raise RuntimeError("Install .env loader: python -m pip install python-dotenv") from exc
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
+
 # Reuse the already-tested hourly queue and P&L machinery: same definitions,
 # but 5m market timing, formats, and cached data paths are handled here.
 try:
@@ -130,29 +138,46 @@ def fetch(session, key: str, url: str, target: Path, offline: bool, allow_404: b
 
 
 def get_parquet_market(session, key, cache: Path, slug: str, day: date,
-                       kind: str, outcome: str, offline: bool):
+                       kind: str, outcome: str, offline: bool, cloud=None):
     import pandas as pd
     dest = cache / f'{slug}_{kind}_{outcome}.parquet'
     url = f'{BASE}/{kind}/{day:%Y/%m/%d}/{slug}.parquet'
     if kind == 'l2' and outcome == 'No':
         url += '?outcome=No'
-    file = fetch(session,key,url,dest,offline,allow_404=True)
+    if cloud:
+        file=cloud.transfer_pmdata(session,key,url,'btc-5m',dest.name,
+                                  offline=offline,allow_404=True)
+    else:
+        file=fetch(session,key,url,dest,offline,allow_404=True)
     if file is None:
         return None
-    df = pd.read_parquet(file)
+    df = cloud.parquet(file) if cloud else pd.read_parquet(file)
     if 'market_slug' in df.columns:
         df = df[df.market_slug.astype(str).eq(slug)]
     return df if len(df) else None
 
 
 class DailyZipReader:
-    def __init__(self):
+    def __init__(self, cloud=None):
         self.members = {}
+        self.cloud=cloud
+        self.handles={}
 
-    def read(self, zip_path: Path, slug: str):
+    def close(self):
+        for z in self.handles.values():
+            z.close()
+        self.handles.clear()
+
+    def read(self, zip_path, slug):
         import pandas as pd
-        if zip_path not in self.members:
-            with zipfile.ZipFile(zip_path) as z:
+        if self.cloud:
+            if zip_path not in self.handles:
+                self.handles[zip_path]=self.cloud.open_zip(zip_path)
+            z=self.handles[zip_path]
+        else:
+            z=zipfile.ZipFile(zip_path)
+        try:
+            if zip_path not in self.members:
                 mapping = {}
                 for fn in z.namelist():
                     if not fn.lower().endswith('.parquet') or fn.startswith('__MACOSX'):
@@ -161,14 +186,16 @@ class DailyZipReader:
                     if m:
                         mapping[m.group()] = fn
                 self.members[zip_path] = mapping
-        filename = self.members[zip_path].get(slug)
-        if filename is None:
-            return None
-        with zipfile.ZipFile(zip_path) as z:
+            filename = self.members[zip_path].get(slug)
+            if filename is None:
+                return None
             df = pd.read_parquet(io.BytesIO(z.read(filename)))
-        if 'market_slug' in df.columns:
-            df = df[df.market_slug.astype(str).eq(slug)]
-        return df if len(df) else None
+            if 'market_slug' in df.columns:
+                df = df[df.market_slug.astype(str).eq(slug)]
+            return df if len(df) else None
+        finally:
+            if not self.cloud:
+                z.close()
 
 
 def make_row(slug,t0,up,down,trades,winner,price,size,latency,max_age):
@@ -222,7 +249,14 @@ def backtest(args):
     out=Path(args.output_dir)
     cache=out/'cache'
     out.mkdir(parents=True,exist_ok=True)
-    cache.mkdir(parents=True,exist_ok=True)
+    cloud=None
+    if args.storage=='supabase':
+        from pmdata_supabase_storage import SupabaseArchive, migrate_cache
+        cloud=SupabaseArchive()
+        if args.migrate_cache:
+            migrate_cache(cloud,'btc-5m',cache)
+    else:
+        cache.mkdir(parents=True,exist_ok=True)
     source=args.source
     if source == 'auto':
         source = 'individual' if args.hours <= 6 else 'daily'
@@ -231,21 +265,26 @@ def backtest(args):
           f'({args.hours*12} markets); source={source}; price={args.price:.2f}',flush=True)
     session=requests.Session()
     files={}
-    zipreader=DailyZipReader()
+    zipreader=DailyZipReader(cloud=cloud)
     if source=='daily':
         for kind,outcome in (('l2','Yes'),('l2','No'),('trades','All')):
             file=cache/f'{day}_{kind}_{outcome}_btc-5m.zip'
             url=f'{BASE}/{kind}/{day:%Y/%m/%d}/btc-5m.zip'
             if kind=='l2' and outcome=='No':
                 url += '?outcome=No'
-            files[kind,outcome]=fetch(session,key,url,file,args.offline)
+            if cloud:
+                files[kind,outcome]=cloud.transfer_pmdata(
+                    session,key,url,'btc-5m',file.name,offline=args.offline)
+            else:
+                files[kind,outcome]=fetch(session,key,url,file,args.offline)
     rows=[]
     for i,(slug,t0) in enumerate(slots(day,args.start_hour,args.hours),1):
         print(f'[{i:>3}/{args.hours*12}] {slug}',flush=True)
         def load(kind,outcome):
             if source=='daily':
                 return zipreader.read(files[kind,outcome],slug)
-            return get_parquet_market(session,key,cache,slug,day,kind,outcome,args.offline)
+            return get_parquet_market(session,key,cache,slug,day,kind,outcome,
+                                      args.offline,cloud)
         up=load('l2','Yes')
         down=load('l2','No')
         trades=load('trades','All') if up is not None and down is not None else None
@@ -257,6 +296,7 @@ def backtest(args):
         rows.append(r)
         if r['missing']:
             print('  Missing Yes or No L2; market excluded',flush=True)
+    zipreader.close()
     valid=[r for r in rows if not r['missing']]
     horizons=[1,2,3,4,5]
     result=summarize(valid,round(args.price,4),args.size,horizons)
@@ -279,6 +319,9 @@ def backtest(args):
         w.writeheader()
         w.writerows(rows)
     jsonfile.write_text(json.dumps(result,indent=2,allow_nan=False))
+    if cloud:
+        cloud.put_result(jsonfile,f'research/polymarket/btc-5m/{jsonfile.name}')
+        cloud.put_result(csvfile,f'research/polymarket/btc-5m/{csvfile.name}')
     print('\n=== BTC 5m two resting bids, price %.2f ==='%args.price, flush=True)
     print(json.dumps(result['metadata'],indent=2))
     for universe in ('both_resting','all_valid_books'):
@@ -351,6 +394,10 @@ def main():
                    help='Use Gamma only to resolve markets missing L2 market_resolved event')
     p.add_argument('--offline',action='store_true',help='Rerun from cached files only')
     p.add_argument('--output-dir',default='data/research/poly_btc5m_4545')
+    p.add_argument('--storage',choices=('supabase','local'),default='supabase',
+                   help='Supabase Storage (default), local disk only stores small backtest results')
+    p.add_argument('--migrate-cache',action='store_true',
+                   help='Upload existing Codespace cache files to Storage (no deletion)')
     p.add_argument('--self-test',action='store_true')
     args=p.parse_args()
     self_test() if args.self_test else backtest(args)
